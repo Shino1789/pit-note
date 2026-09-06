@@ -10,6 +10,9 @@
 # ・RDSのデータ、S3の画像、ECRのDocker image、JWT secretは失われる
 # ・Route53 Hosted Zone / IAM / OIDC / ACM / AWS Budgets / Vercel Project
 #   自体は削除されない（Terraform管理外のため）
+# ・Vercel pauseはfail-closed: pauseに失敗した場合、AWS destroyは
+#   一切実行せず終了する（Frontendが公開されたままBackendだけ
+#   destroyされる中途半端な状態を避けるため）
 # ・実行には二段階の明示的確認が必須
 #   1) スクリプト開始直後: 破棄する意思そのものを、固定フレーズの
 #      完全一致入力で確認する（誤って実行しただけでは進まない）
@@ -141,13 +144,17 @@ fi
 
 # --------------------------------------------------
 # 9. Vercel pause
+# ・fail-closed: pauseに失敗した場合、AWS destroyは絶対に実行しない。
+#   Frontend（Vercel）が公開されたままBackend（AWS）だけdestroyされる、
+#   という中途半端な状態を避けるため
 # --------------------------------------------------
 log_step "Vercel Project を pause します"
 if vercel project pause "$VERCEL_PROJECT_NAME" --yes 2>&1; then
   log_info "Vercel Projectをpauseしました"
 else
-  log_warn "Vercel Projectのpauseに失敗しました。AWSのdestroyは続行します。"
-  log_warn "後で手動で 'vercel project pause $VERCEL_PROJECT_NAME' を実行してください。"
+  rm -f "$DESTROY_PLAN_FILE"
+  die "Vercel Projectのpauseに失敗したためAWS destroyを中止します" \
+    "Vercelの状態を確認し（vercel project inspect $VERCEL_PROJECT_NAME 等）、pause成功後に ./scripts/prod/shutdown.sh を再実行してください。"
 fi
 
 # --------------------------------------------------

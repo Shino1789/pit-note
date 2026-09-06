@@ -40,9 +40,11 @@ terraform plan -destroy
 自動化スクリプトを使う場合（推奨。安全確認・destroy対象表示・Vercel pauseを一貫して行う）:
 
 ```bash
-./scripts/prod/shutdown.sh          # 通常実行（yes入力による明示確認あり）
+./scripts/prod/shutdown.sh          # 通常実行（二段階の明示的確認あり）
 ./scripts/prod/shutdown.sh --dry-run  # destroy対象の確認のみ（実行しない）
 ```
+
+**Vercel pauseはfail-closed設計**: pauseに失敗した場合、`shutdown.sh`はAWSのdestroyを一切実行せず終了する（Frontendが公開されたままBackendだけdestroyされる中途半端な状態を避けるため）。
 
 手動で行う場合:
 
