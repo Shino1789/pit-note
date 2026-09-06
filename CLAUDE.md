@@ -54,26 +54,28 @@ Pitvia（走るクルマのための整備記録・ショップ連携アプリ�
 
 ## 開発用スクリプト
 
+`scripts/dev/` 配下にあります。**ローカルDocker Compose環境専用**であり、本番β環境（後述）には使用しません。
+
 ```bash
-./scripts/up.sh
+./scripts/dev/up.sh
 ```
 
 全コンテナを起動し、Web・APIのヘルスチェック完了後にブラウザを開きます。
 
 ```bash
-./scripts/down.sh
+./scripts/dev/down.sh
 ```
 
 全コンテナを停止します。
 
 ```bash
-./scripts/logs.sh
+./scripts/dev/logs.sh
 ```
 
 全コンテナのログを表示します。
 
 ```bash
-./scripts/reset.sh
+./scripts/dev/reset.sh
 ```
 
 コンテナ・Volume を削除します。
@@ -130,6 +132,73 @@ docker-compose.dev.yml
   - バケット作成
   - ポリシー設定
   - 整備写真保存用オブジェクトストレージ初期化
+
+---
+
+# 本番β環境（AWS / Vercel）
+
+**本番β環境は実際に課金が発生する実インフラです。開発環境（上記）とは完全に別物として扱ってください。**
+
+## 構成
+
+- AWS region: `ap-northeast-1`
+- Frontend: Vercel
+- Backend: ECS/Fargate
+- Database: RDS PostgreSQL
+- Container image: ECR
+- Load Balancer: ALB
+- Object storage: S3
+
+以下はTerraform管理外（Terraformで作成・変更・削除しない）:
+
+- DNS: Route53 Hosted Zone
+- Certificate: ACM
+- IAM / GitHub OIDC
+- AWS Budgets
+
+## Terraform
+
+- Terraform State: S3 backend `pitvia-terraform-state`
+- AWS: `infra/terraform/aws`
+- Vercel: `infra/terraform/vercel`
+- State用S3バケット自体の作成: `infra/terraform/bootstrap`（Local State管理）
+
+詳細は `docs/infrastructure/terraform.md` を参照。
+
+## 運用スクリプト
+
+`scripts/prod/` 配下にあります。開発用の `scripts/dev/` とは明確に別物です。
+
+```bash
+./scripts/prod/status.sh
+```
+
+本番β環境の状態確認（read-only）。
+
+```bash
+./scripts/prod/shutdown.sh
+```
+
+本番β環境をpause + AWS destroyする**破壊的操作**。二段階の明示的確認が必須。
+
+```bash
+./scripts/prod/recover.sh
+```
+
+Terraform apply + Secret再投入 + GitHub Actions CD + 疎通確認 + Vercel resumeによる復旧。
+
+詳細は `scripts/README.md`、`docs/operations/shutdown.md`、`docs/operations/recovery.md` を参照。
+
+## 重要な運用ルール
+
+- 本番βAWSリソースを直接`aws` CLIで削除しない
+- 本番βの破棄は原則 `./scripts/prod/shutdown.sh`、復旧は原則 `./scripts/prod/recover.sh`、状態確認は `./scripts/prod/status.sh` を使う
+- `terraform destroy` を手動で直接実行する場合は、必ず事前にdestroy対象（`terraform plan -destroy`）を確認する
+- Route53 Hosted Zone / IAM / GitHub OIDC / ACM / AWS BudgetsはTerraform管理外であり、destroyしてはいけない
+- Vercel Project自体は削除しない。休止時はpause、復旧時はresumeする（Vercel Terraform Providerはpause/resumeを管理していない）
+- JWT Secret・RDSマスターパスワード等のSecret実値を、コード・Terraform State・ログのいずれにも出力・保存しない
+- RDS / S3 / ECR / ECS / ALB / NAT Gateway等は、β環境のshutdown/recovery検証でdestroy/recreate対象になり得る。destroyするとRDSデータ、S3画像、ECR image、JWT Secretの値などが失われるため、実行前に必ず内容を確認する
+- **本番β環境のdestroy/recoveryは破壊的操作であるため、ユーザーの明示的な承認なしに実行しない**（本セクションの記載は、上記編集ポリシー・commit/push方針と同様に適用される）
 
 ---
 
