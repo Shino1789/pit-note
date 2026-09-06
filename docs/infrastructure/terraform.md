@@ -240,3 +240,20 @@ Regional NAT Gateway（`availability_mode = "regional"`）を作成すると、A
 
 - Vercel Projectの一部設定（`auto_assign_custom_domains`、SSO Protectionなど）は今回のスコープ外としてTerraformコードに含めていない。
 - 環境変数を追加する場合は、必ず`vercel_project`の`environment`属性ではなく`vercel_project_environment_variable`リソースを使用すること（上記の理由により、前者は既存変数の更新で失敗する）。
+
+---
+
+# shutdown/recovery設計判断（自動化可能 / 手動作業 / 要検証）
+
+「destroy→apply→recoveryで本当にβ環境を復旧できるか」を検討する上での個別論点。`scripts/prod/shutdown.sh` / `scripts/prod/recover.sh` / `scripts/prod/status.sh`と`docs/operations/shutdown.md` / `recovery.md`に対応する。
+
+| 論点 | 分類 | 内容 |
+| --- | --- | --- |
+| A. terraform apply直後にECSがECR image不存在で失敗する可能性 | **自動化可能** | 初回applyのTask Definitionは`<ECRリポジトリURL>:latest`という雛形を参照するが、ECRは空のため必ず起動に失敗する。これは想定内で、`prod/recover.sh`もこの状態を前提に、ECSの安定化を待たずに直後のGitHub Actions CDへ進む設計にしている。CDが正しいimageで新revisionを登録した時点で正常化する。 |
+| B. RDS再作成後にFlywayで初期migrationが自動実行されるか | **自動化可能（要検証）** | Spring Boot標準のFlyway自動実行（`spring.flyway.enabled`既定値）により、アプリ起動時に空のDBへ`db/migration`が自動適用される設計。ただし実際のdestroy→recoveryサイクルでの実地確認はまだ行っていないため、次回実施時にCloudWatch Logsでの確認が必須。 |
+| C. ALB再作成後にRoute53 Aliasをどう更新するか | **手動作業** | Route53 Hosted Zoneは意図的にTerraform管理外。`prod/recover.sh`は現在のAliasと新ALBのDNS名を自動比較し、差分があれば実行すべき`aws route53 change-resource-record-sets`コマンドを画面表示した上で処理を停止する（DNS誤設定の影響が大きいため自動実行はしない）。 |
+| D. ACM証明書を再利用できるか | **自動化可能** | `data "aws_acm_certificate" "api"`で既存の発行済み証明書を参照する設計のため、ALBが再作成されてもACM証明書自体は不変・自動的に再アタッチされる。手動作業は不要。 |
+| E. JWT secret再作成後の再投入方法 | **自動化可能** | `prod/recover.sh`が`openssl rand`で新しい値を生成し、画面・ログに一切出力せず`put-secret-value`で投入する。既に値が設定済みの場合はスキップ（`--force-jwt-reset`で強制可）。リフレッシュトークン無効化は許容済みの仕様。 |
+| F. Vercel pause/resumeをどこで実施するか | **自動化可能** | Terraform Provider非対応のため、`prod/shutdown.sh`/`prod/recover.sh`内でVercel CLI（`vercel project pause/resume`）を直接呼び出す。失敗してもAWS側の処理はブロックせず、警告を出して手動対応を促す。 |
+| G. GitHub Actions CDをmainから安全にworkflow_dispatchできるか | **自動化可能** | `deploy.yml`の`workflow_dispatch`はinput無しで安全に実行できる仕様。`gh workflow run deploy.yml --ref main`を実機で複数回実行し成功を確認済み。`prod/recover.sh`はrun IDを特定し、完了・成功まで自動監視する。 |
+| H. recovery完了後にterraform plan = No changesになるか | **要検証** | 現在の定常状態（destroyを経ていない状態）でのapply→CD実行→plan確認では`No changes`を確認済み。ただし実際のdestroy→apply一巡でも同じ結果になるかは、本ドキュメント整備時点ではまだ実地検証していない（`docs/operations/shutdown.md` / `recovery.md`の手順自体は整備済み）。 |
