@@ -151,6 +151,19 @@ resource "aws_ecs_service" "api" {
   deployment_minimum_healthy_percent = 100
   enable_ecs_managed_tags            = true
 
+  # ・force_delete: destroy時にdesired_countを0へ縮退させてから
+  #   削除する既定動作をスキップし、即座に強制削除する。
+  #   実機検証で、既定動作（グレースフルなスケールダウン+ALBの
+  #   deregistration_delay=300秒の経過待ち）にService削除だけで
+  #   6分以上かかり、その待機中にAWS API呼び出しの一時的な失敗に
+  #   遭遇する時間的猶予が生まれてしまうことを確認した。destroy
+  #   （環境の完全な破棄）では次の状態へ引き継ぐグレースフルな
+  #   ドレインは不要なため、β版のdestroy運用に限り強制削除で
+  #   時間を短縮する。CD（deploy.yml）が行う通常のデプロイ更新や、
+  #   recover.shでのapply（新規作成）には一切影響しない
+  #   （force_deleteはdestroy時のみ参照される属性のため）
+  force_delete = true
+
   tags = {
     Name = "pitvia-api-service"
   }

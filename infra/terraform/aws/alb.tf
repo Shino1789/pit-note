@@ -19,6 +19,19 @@ resource "aws_lb" "main" {
   tags = {
     Name = "pitvia-alb"
   }
+
+  # ・internet-facing ALBはENIにpublic IPv4アドレスを持つため、
+  #   AWS公式仕様上（DetachInternetGateway API: "The VPC must not
+  #   contain any running instances with Elastic IP addresses or
+  #   public IPv4 addresses."）、Internet Gatewayのdetachをブロックしうる。
+  #   Terraformコード上はALBがIGWを直接参照していないため、暗黙の
+  #   依存関係が存在せず、destroy時にIGWがALBより先に破棄されようと
+  #   して DependencyViolation で失敗する事故が実機で発生した。
+  #   aws_nat_gateway.main（同ファイル群内）と同様に、明示的な
+  #   depends_onでIGWとの順序を保証する
+  #   - CREATE: IGW → ALB
+  #   - DESTROY: ALB（および依存するhttps/httpリスナー・ECS Service）→ IGW
+  depends_on = [aws_internet_gateway.main]
 }
 
 resource "aws_lb_target_group" "api" {
