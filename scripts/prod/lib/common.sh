@@ -130,6 +130,42 @@ check_vercel_auth() {
   log_info "Vercel CLIの認証を確認しました"
 }
 
+# Vercel Projectのpause状態を確認する（read-only）
+# ・出力: "true"（pause済み） / "false"（未pause） / "unknown"（確認不可）
+# ・`vercel project pause/resume`は非対話環境（TTY以外）から実行できない
+#   仕様であることが実機確認済み（stdinへ確認文字列をpipeしても、
+#   TTY判定の時点で内容を見ずに拒否される）。そのためpause/resumeの
+#   実行そのものはscriptsから行わず、状態確認のみに用いる
+get_vercel_paused_state() {
+  local token="${VERCEL_API_TOKEN:-${VERCEL_TOKEN:-}}"
+  if [ -z "$token" ]; then
+    local auth_file="$HOME/Library/Application Support/com.vercel.cli/auth.json"
+    if [ -f "$auth_file" ]; then
+      token=$(jq -r '.token // empty' "$auth_file" 2>/dev/null || echo "")
+    fi
+  fi
+  if [ -z "$token" ]; then
+    echo "unknown"
+    return
+  fi
+
+  local project_id
+  project_id=$(terraform -chdir="$TF_VERCEL_DIR" output -raw project_id 2>/dev/null || echo "")
+  if [ -z "$project_id" ]; then
+    echo "unknown"
+    return
+  fi
+
+  local paused
+  paused=$(curl -s -H "Authorization: Bearer $token" \
+    "https://api.vercel.com/v9/projects/$project_id" 2>/dev/null | jq -r '.paused // false' 2>/dev/null || echo "")
+  case "$paused" in
+    true) echo "true" ;;
+    false) echo "false" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
 # 現在のgit branch/作業状態を表示する（判断材料の提示のみ。ブロックはしない）
 show_git_context() {
   log_step "Gitブランチ/作業状態確認"
@@ -160,6 +196,105 @@ check_terraform_backend() {
     grep -q 'backend "s3"' "$main_tf" && \
       die "$dir はLocal State運用のはずですが、S3 backendが設定されています" "infra/terraform/bootstrap/README.mdの設計意図を確認してください。"
   fi
+}
+
+# --------------------------------------------------
+# destroy retry設定
+# ・無限retryは禁止。最大試行回数と累計経過時間の両方で上限を設ける
+# --------------------------------------------------
+DESTROY_MAX_ATTEMPTS=4          # 初回 + retry3回
+DESTROY_MAX_ELAPSED_SECONDS=1800 # 累計30分
+DESTROY_BACKOFF_BASE_SECONDS=30  # attempt毎のbackoff: 30s, 60s, 90s...
+DESTROY_BACKOFF_MAX_SECONDS=90   # backoffの上限（それ以上は増やさない）
+
+# infra/terraform/aws が現在管理しているAWSリソースの「型」一覧。
+# destroy planにこれ以外のaws_*リソースが含まれていた場合は、
+# コードに想定外の変更が紛れ込んでいる可能性があるため停止する
+# （docs/infrastructure/terraform.mdのImport一覧と対応）
+EXPECTED_DESTROY_RESOURCE_TYPES=" aws_cloudwatch_log_group aws_db_instance aws_db_subnet_group aws_ecr_lifecycle_policy aws_ecr_repository aws_ecs_cluster aws_ecs_service aws_ecs_task_definition aws_internet_gateway aws_lb aws_lb_listener aws_lb_target_group aws_nat_gateway aws_route aws_route_table aws_route_table_association aws_s3_bucket aws_s3_bucket_policy aws_s3_bucket_public_access_block aws_s3_bucket_server_side_encryption_configuration aws_s3_bucket_versioning aws_secretsmanager_secret aws_security_group aws_subnet aws_vpc "
+
+# terraform apply（destroy）が失敗した際のエラーメッセージを分類する。
+# 出力: "retry"（一時的なエラー、retry候補） / "fatal"（即停止）
+# ・retry対象は「既知の一時的エラー」に限定し、それ以外は
+#   すべてfail-closed（fatal）とする（無条件retryは行わない）
+# ・DependencyViolationは無条件retryにせず、IGW/NAT Gateway/EIP関連の
+#   既知パターン（本番で実際に発生したケース）に一致する場合のみ
+#   retry対象とする
+classify_destroy_error() {
+  local err="$1"
+
+  # 即停止（設定ミス・権限・認証・state異常）を先に判定する
+  if echo "$err" | grep -qE \
+    'AccessDenied|UnauthorizedOperation|ExpiredToken|InvalidClientTokenId|AuthFailure|InvalidParameterValue|InvalidParameter([^V]|$)|Error acquiring the state lock|Invalid provider configuration|Unsupported argument|Unsupported block type|Reference to undeclared'; then
+    echo "fatal"
+    return
+  fi
+
+  # DependencyViolationは既知の一時的パターンに限定してretry対象にする
+  if echo "$err" | grep -qE 'DependencyViolation'; then
+    if echo "$err" | grep -qiE 'internet gateway|nat gateway|mapped public address|elastic ip|\bEIP\b'; then
+      echo "retry"
+    else
+      echo "fatal"
+    fi
+    return
+  fi
+
+  # その他の既知の一時的エラー（DNS/ネットワーク/AWS API一時障害）
+  if echo "$err" | grep -qE \
+    'no such host|i/o timeout|connection reset|context deadline exceeded|RequestTimeout|Throttling|RequestLimitExceeded|TooManyRequestsException|InternalError|ServiceUnavailable'; then
+    echo "retry"
+    return
+  fi
+
+  # 既知パターンに一致しない正体不明のエラーは、安全側（fail-closed）
+  # に倒して即停止する
+  echo "fatal"
+}
+
+# destroy planが「純粋なdestroyのみ」であり、想定している管理対象
+# リソース種別の範囲内であることを確認する（read-only、AWSは変更しない）
+# 戻り値: 0=安全 / 1=想定外の内容あり（呼び出し側でdieすること）
+validate_destroy_only_plan() {
+  local plan_file="$1"
+  local show_output
+  show_output=$( (cd "$TF_AWS_DIR" && terraform show -no-color "$plan_file") )
+
+  local summary
+  summary=$(echo "$show_output" | grep -E "^Plan:" || echo "")
+  echo "  ${summary:-Plan: (取得失敗)}"
+
+  if [ -z "$summary" ]; then
+    log_warn "plan summaryを取得できませんでした"
+    return 1
+  fi
+
+  # add/changeが0件でなければNG（destroy以外の操作を許可しない）
+  if [[ "$summary" != *"0 to add"* ]] || [[ "$summary" != *"0 to change"* ]]; then
+    log_warn "destroy以外の変更（add/change）が含まれています"
+    return 1
+  fi
+
+  # replace（作り直し）が1件でもあれば即NG
+  if echo "$show_output" | grep -q "must be replaced"; then
+    log_warn "resourceのreplace（作り直し）が含まれています"
+    return 1
+  fi
+
+  # destroy対象のリソースアドレスが、既知の管理対象リソース種別の
+  # 範囲内であることを確認する（「常に38件」ではなく「想定される
+  # 型のdestroyだけが残っている」ことを確認する設計）
+  local addr rtype
+  while IFS= read -r addr; do
+    [ -z "$addr" ] && continue
+    rtype="${addr%%.*}"
+    if [[ "$EXPECTED_DESTROY_RESOURCE_TYPES" != *" $rtype "* ]]; then
+      log_warn "想定外のリソース種別がdestroy対象に含まれています: $addr"
+      return 1
+    fi
+  done < <(echo "$show_output" | awk '/^  # / && /will be destroyed/ { print $2 }')
+
+  return 0
 }
 
 # 破壊的操作の前に、単純なyes/noではなく完全一致の文字列入力を要求する

@@ -310,7 +310,7 @@ fi
 log_step "Vercel Project resume判定"
 if [ "$health_ok" = true ]; then
   log_info "AWS側のヘルスチェックがすべて正常なため、Vercel Projectをresumeします"
-  if vercel project resume "$VERCEL_PROJECT_NAME" --yes 2>&1; then
+  if vercel project resume "$VERCEL_PROJECT_NAME" --non-interactive 2>&1; then
     log_info "Vercel Projectをresumeしました"
   else
     log_warn "Vercel Projectのresumeに失敗しました。手動で 'vercel project resume $VERCEL_PROJECT_NAME' を実行してください。"
