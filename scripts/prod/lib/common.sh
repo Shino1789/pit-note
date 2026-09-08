@@ -166,6 +166,53 @@ get_vercel_paused_state() {
   esac
 }
 
+# Vercel Projectをresumeする（production traffic再開。破壊的ではないが
+# 課金・公開状態に影響するAPI呼び出しのため慎重に扱う）
+# ・`vercel project resume ... --non-interactive`は使わない。CLI実装を
+#   確認したところ、`resume`もcanPrompt(client)（=stdin.isTTYかつ
+#   nonInteractiveでない場合のみtrue）がfalseだと対話確認をスキップできず
+#   必ずaction_requiredで失敗する（--non-interactiveを外してもstdinが
+#   TTYでない限り同様）。recover.shは自動ポーリング（CD完了待ち等）を
+#   挟む半自動スクリプトであり、途中で対話プロンプトが挟まると
+#   人が張り付いていない場合に無期限へハングしうるため採用しない。
+#   get_vercel_paused_state()と同じ認証方式・project_id解決方式で、
+#   REST API（POST /v1/projects/{id}/unpause）を直接呼び出す
+#   （CLIのTTY依存を排除し、実行環境によらず決定的に動作させる）
+# ・戻り値: 0=成功 / 1=失敗（呼び出し側でlog_warnし、手動resumeを促すこと）
+# ・token/project_idの値は絶対にecho/logしない。レスポンスボディも
+#   破棄する（-o /dev/null）
+resume_vercel_project() {
+  local token="${VERCEL_API_TOKEN:-${VERCEL_TOKEN:-}}"
+  if [ -z "$token" ]; then
+    local auth_file="$HOME/Library/Application Support/com.vercel.cli/auth.json"
+    if [ -f "$auth_file" ]; then
+      token=$(jq -r '.token // empty' "$auth_file" 2>/dev/null || echo "")
+    fi
+  fi
+  if [ -z "$token" ]; then
+    log_warn "Vercel APIトークンを取得できませんでした"
+    return 1
+  fi
+
+  local project_id
+  project_id=$(terraform -chdir="$TF_VERCEL_DIR" output -raw project_id 2>/dev/null || echo "")
+  if [ -z "$project_id" ]; then
+    log_warn "Vercel Project IDを取得できませんでした（terraform output）"
+    return 1
+  fi
+
+  local http_code
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    -H "Authorization: Bearer $token" \
+    "https://api.vercel.com/v1/projects/$project_id/unpause")
+
+  if [ "$http_code" -ge 200 ] 2>/dev/null && [ "$http_code" -lt 300 ] 2>/dev/null; then
+    return 0
+  fi
+  log_warn "Vercel resume APIが失敗しました（HTTP $http_code）"
+  return 1
+}
+
 # 現在のgit branch/作業状態を表示する（判断材料の提示のみ。ブロックはしない）
 show_git_context() {
   log_step "Gitブランチ/作業状態確認"

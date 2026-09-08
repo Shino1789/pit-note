@@ -89,9 +89,19 @@ fi
 # 6. ユーザー確認 → 7. terraform apply
 # --------------------------------------------------
 log_step "terraform apply確認"
-read -r -p "上記planでAWSリソースを作成/更新します。続行しますか？ [yes/no]: " answer
-if [ "$answer" != "yes" ]; then
-  log_info "キャンセルしました"
+# ・set -e下でread自体がEOF等で失敗すると、この行で即座に
+#   スクリプトが終了し、以降の「キャンセルしました」の表示も
+#   plan file削除も行われないまま終了する。read自体をif条件に
+#   置くことでその挙動を吸収し、yes / no / EOF・read失敗の
+#   3パターンを明示的に分岐する（shutdown.shと同じパターン）
+if read -r -p "上記planでAWSリソースを作成/更新します。続行しますか？ [yes/no]: " answer; then
+  if [ "$answer" != "yes" ]; then
+    log_info "キャンセルしました"
+    rm -f "$APPLY_PLAN_FILE"
+    exit 0
+  fi
+else
+  log_info "入力を受け取れなかったためキャンセルしました"
   rm -f "$APPLY_PLAN_FILE"
   exit 0
 fi
@@ -310,7 +320,7 @@ fi
 log_step "Vercel Project resume判定"
 if [ "$health_ok" = true ]; then
   log_info "AWS側のヘルスチェックがすべて正常なため、Vercel Projectをresumeします"
-  if vercel project resume "$VERCEL_PROJECT_NAME" --non-interactive 2>&1; then
+  if resume_vercel_project; then
     log_info "Vercel Projectをresumeしました"
   else
     log_warn "Vercel Projectのresumeに失敗しました。手動で 'vercel project resume $VERCEL_PROJECT_NAME' を実行してください。"
