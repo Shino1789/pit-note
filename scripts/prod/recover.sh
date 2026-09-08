@@ -27,7 +27,9 @@
 #   12. ECSロールアウト確認
 #   13. ALB Target Health確認
 #   14. ALB直接health確認（DNSを経由せず、ALBのDNS名に直接アクセス）
-#   15. Route53 Alias確認（差分があれば手動対応として停止）
+#   15. Route53 Alias確認・自動UPSERT（ALB再作成でDNS名が変わった
+#       場合、api.pitviaapp.comのA Aliasだけを新ALBへ自動更新する。
+#       Route53 Hosted Zone自体はTerraform管理外のまま）
 #   16. API health確認（カスタムドメイン経由）
 #   17. Vercel resume ※12〜16すべてが正常な場合のみ実行する
 #       （AWS側の復旧を確認しないまま一般公開しないための安全条件）
@@ -249,54 +251,107 @@ if [ "$alb_direct_code" != "200" ]; then
 fi
 
 # --------------------------------------------------
-# 15. Route53 Alias確認
-# ・ALBが再作成された場合のみDNS名が変わる。差分があれば手動対応
-#   （DNSの誤設定は影響が大きいため自動更新はしない）
+# 15. Route53 Alias確認・自動UPSERT
+# ・Route53 Hosted Zone自体はTerraform管理外のまま変更しない。
+#   api.pitviaapp.com のA Alias 1レコードだけを、recover.shが
+#   現在のALB情報（DNS名・Hosted Zone ID）へ自動UPSERTする。
+#   ALBがdestroy→recreateされてDNS名が変わっても、このステップで
+#   自動的に新ALBへ向け直されるため、手動対応が不要になる
+# ・DNSNameにdualstack.プレフィックスを付けない: 実機のALB
+#   （aws_lb.main）はip_address_type=ipv4（dualstack非対応）で
+#   作成されており、実際に機能しているRoute53レコードも
+#   dualstackプレフィックス無しのプレーンなALB DNS名を使っている
+#   ことを`aws elbv2 describe-load-balancers`/
+#   `aws route53 list-resource-record-sets`で確認済み。推測ではなく
+#   実環境の設定に合わせている
 # --------------------------------------------------
-log_step "Route53 Alias確認"
+log_step "Route53 Alias確認・自動UPSERT"
+
+# ・UPSERT実行条件1〜3: terraform apply成功（既にここまで到達している
+#   時点で満たしている）・alb_dns_name/alb_zone_idが取得できていること
+if [ -z "$alb_dns_name" ]; then
+  die "ALB DNS名を取得できませんでした（terraform output alb_dns_name）" \
+    "terraform state show aws_lb.main で状態を確認してください。"
+fi
+if [ -z "$alb_zone_id" ]; then
+  die "ALB Hosted Zone IDを取得できませんでした（terraform output alb_zone_id）" \
+    "terraform state show aws_lb.main で状態を確認してください。"
+fi
 
 hosted_zone_id=$(aws route53 list-hosted-zones-by-name --dns-name "$FRONTEND_DOMAIN" \
   --query "HostedZones[?Name=='${FRONTEND_DOMAIN}.'].Id | [0]" --output text 2>/dev/null | sed 's|/hostedzone/||')
 
-current_alias_dns=""
-if [ -n "$hosted_zone_id" ] && [ "$hosted_zone_id" != "None" ]; then
-  current_alias_dns=$(aws route53 list-resource-record-sets --hosted-zone-id "$hosted_zone_id" \
-    --query "ResourceRecordSets[?Name=='${ROUTE53_RECORD_NAME}.'].AliasTarget.DNSName | [0]" --output text 2>/dev/null)
+# ・UPSERT実行条件4: Route53 Hosted Zone IDが取得できていること
+#   （見つからない場合はRoute53側の重大な問題の可能性があるため、
+#   自動UPSERTはせず即座に停止する）
+if [ -z "$hosted_zone_id" ] || [ "$hosted_zone_id" = "None" ]; then
+  die "Route53 Hosted Zone（$FRONTEND_DOMAIN）が見つかりませんでした" \
+    "Route53のHosted Zoneが存在するか、AWS権限が正しいか確認してください。"
 fi
+
+echo "  Route53 Hosted Zone ID : $hosted_zone_id"
+echo "  Route53 Record Name    : $ROUTE53_RECORD_NAME"
+echo "  新しいALB DNS          : $alb_dns_name"
+echo "  ALB Zone ID            : $alb_zone_id"
+
+current_alias_dns=$(aws route53 list-resource-record-sets --hosted-zone-id "$hosted_zone_id" \
+  --query "ResourceRecordSets[?Name=='${ROUTE53_RECORD_NAME}.'].AliasTarget.DNSName | [0]" --output text 2>/dev/null)
+echo "  現在のAlias             : ${current_alias_dns:-(レコードなし)}"
 
 normalized_current=$(echo "$current_alias_dns" | sed 's/^dualstack\.//; s/\.$//')
 
-if [ -z "$current_alias_dns" ] || [ "$current_alias_dns" = "None" ]; then
-  log_warn "Route53レコード（$ROUTE53_RECORD_NAME）が見つかりませんでした。手動で確認してください。"
-elif [ "$normalized_current" = "$alb_dns_name" ]; then
+# ・UPSERT実行条件5: レコードが既に存在する（かつ現在のALBと不一致）、
+#   または存在しない（UPSERTで新規作成可能）場合、自動UPSERTする。
+#   既に現在のALBを指している場合のみUPSERTをスキップする
+if [ -n "$current_alias_dns" ] && [ "$current_alias_dns" != "None" ] && [ "$normalized_current" = "$alb_dns_name" ]; then
   log_info "Route53 Aliasは現在のALBを指しています（更新不要）"
 else
-  log_warn "Route53 Aliasが現在のALBと異なります。ALBが再作成された可能性があります。"
-  echo ""
-  echo "  現在のAlias  : $current_alias_dns"
-  echo "  新しいALB    : dualstack.${alb_dns_name}"
-  echo ""
-  echo "  ${COLOR_YELLOW}以下のコマンドで手動更新してください（このスクリプトは自動実行しません）:${COLOR_RESET}"
-  cat <<EOF
+  if [ -z "$current_alias_dns" ] || [ "$current_alias_dns" = "None" ]; then
+    log_info "Route53レコード（$ROUTE53_RECORD_NAME）が存在しないため、新規作成します"
+  else
+    log_info "Route53 Aliasが現在のALBと異なるため、自動UPSERTします（ALBが再作成された可能性があります）"
+  fi
 
-  aws route53 change-resource-record-sets --hosted-zone-id "$hosted_zone_id" --change-batch '{
-    "Changes": [{
-      "Action": "UPSERT",
-      "ResourceRecordSet": {
-        "Name": "${ROUTE53_RECORD_NAME}",
-        "Type": "A",
-        "AliasTarget": {
-          "HostedZoneId": "${alb_zone_id}",
-          "DNSName": "dualstack.${alb_dns_name}",
-          "EvaluateTargetHealth": true
+  # ・change-batch JSONはjq -nで生成する（シェルインジェクション・
+  #   クォート崩れを避けるため、文字列結合ではなく--argで渡す）
+  change_batch=$(jq -n \
+    --arg name "$ROUTE53_RECORD_NAME" \
+    --arg alb_zone_id "$alb_zone_id" \
+    --arg alb_dns "$alb_dns_name" \
+    '{
+      Changes: [{
+        Action: "UPSERT",
+        ResourceRecordSet: {
+          Name: $name,
+          Type: "A",
+          AliasTarget: {
+            HostedZoneId: $alb_zone_id,
+            DNSName: $alb_dns,
+            EvaluateTargetHealth: true
+          }
         }
-      }
-    }]
-  }'
+      }]
+    }')
 
-EOF
-  echo "  ${COLOR_YELLOW}更新後、このスクリプトを再実行するか、以降の手順（Vercel resume等）を手動で続けてください。${COLOR_RESET}"
-  die "Route53 Aliasの手動更新が必要です" "上記コマンドを実行してから ./scripts/prod/recover.sh を再実行してください。"
+  log_info "Route53 UPSERT実行開始"
+  if ! upsert_error=$(aws route53 change-resource-record-sets \
+    --hosted-zone-id "$hosted_zone_id" --change-batch "$change_batch" 2>&1); then
+    die "Route53 Aliasの自動UPSERTに失敗しました: $upsert_error" \
+      "AWS権限（route53:ChangeResourceRecordSets）や change-batch の内容を確認してください。"
+  fi
+  log_info "Route53 UPSERT成功"
+
+  # ・DNS伝播の完了を待つ必要はなく、Route53 API上のレコードが
+  #   正しく更新されたことだけを確認する
+  updated_alias_dns=$(aws route53 list-resource-record-sets --hosted-zone-id "$hosted_zone_id" \
+    --query "ResourceRecordSets[?Name=='${ROUTE53_RECORD_NAME}.'].AliasTarget.DNSName | [0]" --output text 2>/dev/null)
+  normalized_updated=$(echo "$updated_alias_dns" | sed 's/^dualstack\.//; s/\.$//')
+
+  if [ "$normalized_updated" != "$alb_dns_name" ]; then
+    die "Route53レコードの更新後再確認に失敗しました（$ROUTE53_RECORD_NAME が新ALBを指していません）" \
+      "aws route53 list-resource-record-sets --hosted-zone-id $hosted_zone_id で内容を確認してください。"
+  fi
+  log_info "Route53 Aliasを新しいALBへ更新しました（$ROUTE53_RECORD_NAME -> $alb_dns_name）"
 fi
 
 # --------------------------------------------------
