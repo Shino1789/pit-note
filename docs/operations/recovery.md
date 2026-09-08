@@ -9,9 +9,10 @@ Terraformの前提・構成は`docs/infrastructure/terraform.md`を参照。自�
 # 結論
 
 - 復旧は`./scripts/prod/recover.sh`で一貫実行できる（各ステップに確認・失敗時の停止処理あり）。
-- **Terraform applyだけでは復旧は完了しない。** ECR image再push（GitHub Actions CD）、JWT Secret再投入、（ALB再作成時のみ）Route53 Alias手動更新、Vercel resumeが別途必要。
-- JWT Secret再投入・Route53 Alias更新・IAM/ACM/Route53 Hosted Zoneの状態確認は、Terraform管理外のため自動化スクリプトも一部で「手動対応が必要」として明示的に停止する設計にしている。
+- **Terraform applyだけでは復旧は完了しない。** ECR image再push（GitHub Actions CD）、JWT Secret再投入、（ALB再作成時のみ）Route53 Alias自動更新、Vercel resumeが別途必要。
+- JWT Secret再投入・Route53 Alias更新・Vercel resumeは`recover.sh`が自動実行する。IAM/ACM/Route53 Hosted Zone自体はTerraform管理外のため変更しない（状態確認のみ）。
 - 復旧完了の最終確認は「`terraform plan`がNo changesであること」＋「API/Frontendへの実際の疎通確認」の両方で行う。
+- **実地検証（2026-09-08〜09実施）で判明した重要な注意点**: Terraform管理外のIAMインラインポリシー2件（Secrets ARN・ELB権限）と、RDSの`db_name`未設定という3つの問題により、初回の実地復旧では追加のIAM修正・DB手動作成が必要になった。詳細は`docs/infrastructure/terraform.md`の「実地復旧で発覚した問題と対応」を参照。
 
 ---
 
@@ -64,7 +65,15 @@ RDSは新規作成のため、スキーマが存在しない空のデータベ�
 
 CloudWatch Logs（`/ecs/pitvia-api`）でマイグレーション成功のログ（`Successfully applied N migrations`等）を確認する。
 
-> **要検証**: この自動適用は設計・実装上の想定であり、実際のdestroy→recovery実地検証ではまだ確認できていない（今回はコード整備のみ）。次回の実地検証で必ずログを確認すること。
+> **実地検証済み（2026-09-08〜09）**: 自動適用自体は正常に動作することを確認した。ただし、実地検証で以下の重大な既知の落とし穴が判明したため必ず把握しておくこと。
+
+## ⚠️ 既知の落とし穴: `pitvia`データベース自体が存在しない
+
+`aws_db_instance.main`（`rds.tf`）は元々`db_name`が未設定だったため、RDSインスタンス再作成時にデフォルトの`postgres`データベースしか作られず、アプリケーションが接続しようとする`pitvia`データベース自体が存在しない状態になっていた（`FATAL: database "pitvia" does not exist`でコンテナがexit code 1でクラッシュし続ける）。
+
+- **恒久対応**: `rds.tf`に`db_name = "pitvia"`を追加済み。**次回の完全なdestroy→recovery（RDSインスタンス自体が新規作成される場合）では自動的に解消される**はずだが、`db_name`はインスタンス作成時のみ有効な属性のため未検証（次回実地検証時に必ず確認すること）。
+- **もし今後の復旧でも`database "pitvia" does not exist`が再発した場合**（例: `db_name`が何らかの理由で反映されない、または過去のRDSインスタンスを使い回すケース）、一時的なECS Fargate Task（`postgres`公式イメージ、RDSマスターSecretを`secrets`経由で注入、private subnet + ECS SG）で`CREATE DATABASE pitvia;`を実行することで復旧できる（実地検証で採用した方法。既存の`pitvia-ecs-execution-role`の権限で完結し、恒久的なAWSリソースは残らない）。
+- 詳細は`docs/infrastructure/terraform.md`の「実地復旧で発覚した問題と対応」を参照。
 
 ---
 
@@ -88,7 +97,9 @@ aws secretsmanager put-secret-value \
 
 # 6. ALB DNS変更
 
-ALBを再作成すると、ALBのDNS Name（`dualstack.pitvia-alb-xxxxxxxxxx.ap-northeast-1.elb.amazonaws.com`）が変わる。新しいDNS名は以下で取得できる。
+ALBを再作成すると、ALBのDNS Name（`pitvia-alb-xxxxxxxxxx.ap-northeast-1.elb.amazonaws.com`）が変わる。新しいDNS名は以下で取得できる。
+
+> このALB（`aws_lb.main`）は`ip_address_type=ipv4`（dualstack非対応）で作成されているため、DNS名に`dualstack.`プレフィックスは付かない（実機の`aws elbv2 describe-load-balancers`で確認済み）。
 
 ```bash
 terraform -chdir=infra/terraform/aws output -raw alb_dns_name
@@ -99,28 +110,38 @@ terraform -chdir=infra/terraform/aws output -raw alb_zone_id
 
 ---
 
-# 7. Route53 Alias確認
+# 7. Route53 Alias確認・自動UPSERT
 
-`api.pitviaapp.com`のRoute53 AliasレコードはTerraform管理外のため、ALBのDNS名が変わった場合は手動で向き先を更新する必要がある。
+`api.pitviaapp.com`のRoute53 AliasレコードはTerraform管理外だが、`prod/recover.sh`が**このレコード1件だけ**を自動更新する（Route53 Hosted Zone自体や他のレコードには一切触れない）。
 
 `prod/recover.sh`は現在のRoute53レコードと6.で取得したALBのDNS名を自動比較し、
 
-- 一致していれば「更新不要」として次に進む
-- 異なっていれば、実行すべき`aws route53 change-resource-record-sets`コマンドを画面に表示した上で**処理を停止する**（自動更新はしない。DNSの誤設定は影響範囲が大きいため）
+- 一致していれば「更新不要」として次に進む（Route53 APIは呼ばない）
+- レコードが存在しない、または異なっていれば、`jq -n`で安全に生成したchange-batch JSONを使って`aws route53 change-resource-record-sets`（UPSERT）を自動実行し、反映結果を再取得して新ALBを指していることを確認してから次に進む
+- UPSERT自体が失敗した場合、または更新後の再確認で不一致が確認された場合は、その時点で`die`し、Vercel resume・Frontend health確認には進まない（fail-closed設計を維持）
 
-停止した場合は、表示されたコマンドを実行してから`./scripts/prod/recover.sh`を再実行する。
+手動更新が必要になるのは、Route53 Hosted Zone自体が見つからない等、UPSERTの前提条件（後述）が満たせない異常時のみ。
+
+**UPSERT実行条件**: ALB DNS名・ALB Hosted Zone ID・Route53 Hosted Zone IDのいずれかが取得できない場合はUPSERTせず即座に`die`する。
 
 ---
 
 # 8. Vercel resume
 
-```bash
-vercel project resume pitvia
-```
-
 Vercel ProjectとProject設定（`infra/terraform/vercel`）自体は`shutdown.md`の手順で削除していないため、`terraform apply`は不要（設定に変更がある場合のみ`terraform plan`で差分を確認の上apply）。
 
-`prod/recover.sh`は上記CLIを自動実行する。失敗してもAWS側の復旧は完了しているため処理は止めず、警告を表示して手動対応を促す。
+`prod/recover.sh`は`common.sh`の`resume_vercel_project()`を自動実行する。これは`vercel project resume ... --non-interactive`ではなく、**Vercel REST API（`POST /v1/projects/{id}/unpause`）を直接呼び出す方式**。
+
+> **なぜCLIを使わないか**: Vercel CLIの`project resume`は、実行時のstdinがTTYでない（＝スクリプトから実行している）場合、`--non-interactive`を付けても必ず対話確認エラーで失敗することをCLIバンドルのソースコードで確認済み（`canPrompt(client) = Boolean(client.stdin.isTTY) && !client.nonInteractive`）。`recover.sh`はGitHub Actions CD完了待ち等の自動ポーリングを挟む半自動スクリプトのため、途中に対話プロンプトが挟まると無期限にハングするリスクがある。REST API方式はこの制約を受けず、`get_vercel_paused_state()`（`shutdown.sh`が使う読み取り専用の状態確認）と同じ認証方式（`VERCEL_API_TOKEN`/`VERCEL_TOKEN`環境変数、無ければ`~/Library/Application Support/com.vercel.cli/auth.json`）・Project ID解決方式（`terraform -chdir=infra/terraform/vercel output -raw project_id`）を流用している。
+
+失敗してもAWS側の復旧は完了しているため処理は止めず、警告を表示して手動対応（`vercel project resume pitvia`をご自身の対話ターミナルで実行）を促す。
+
+> **実地検証での注意点**: `resume_vercel_project()`は`infra/terraform/vercel`が`terraform init`済みであることに依存する。実行環境でこのディレクトリが未初期化だと`Vercel Project IDを取得できませんでした`という警告で失敗する（AWS側は無関係に正常なまま）。事前に`terraform -chdir=infra/terraform/vercel init`しておくか、失敗した場合は`terraform init`後に手動で以下を実行して復旧できる。
+>
+> ```bash
+> source scripts/prod/lib/common.sh
+> resume_vercel_project
+> ```
 
 ---
 
@@ -163,7 +184,7 @@ terraform plan
 - [ ] GitHub Actions `deploy.yml`が成功（`conclusion: success`）
 - [ ] ECS Serviceの`runningCount`が`desiredCount`と一致し、Circuit Breakerによるロールバックが発生していない
 - [ ] ALB Target Groupが`healthy`
-- [ ] Route53 Aliasが現在のALBを指している（ALB再作成時は手動更新済み）
+- [ ] Route53 Aliasが現在のALBを指している（ALB再作成時は`recover.sh`が自動UPSERT済み）
 - [ ] JWT Secretに値が投入されている
 - [ ] `https://api.pitviaapp.com/api/v1/health`が200
 - [ ] `https://pitviaapp.com`が正常応答（307/200等、ログイン画面への到達含む）

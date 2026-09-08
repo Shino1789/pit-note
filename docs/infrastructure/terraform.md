@@ -74,9 +74,9 @@ infra/terraform/
 | IAM Role（`pitvia-ecs-execution-role` / `pitvia-ecs-task-role` / `pitvia-github-actions-deploy-role`） | 権限管理はTerraform化のスコープ外。誤操作でCDや実行権限を壊すリスクを避けるため |
 | GitHub OIDC Provider | 同上 |
 | ACM証明書（`api.pitviaapp.com`） | 証明書の再発行・検証待ちが発生すると復旧時間が読めなくなるため |
-| Route53 Hosted Zone / レコード | ALB再作成時にDNS Nameが変わるため、Aliasレコードの更新は手動（`docs/operations/recovery.md`参照） |
+| Route53 Hosted Zone / レコード | Hosted Zone自体はTerraform管理外。ただし`api.pitviaapp.com`のAliasレコード1件だけは、ALB再作成でDNS名が変わった場合に`recover.sh`が自動UPSERTする（Hosted Zoneや他レコードは変更しない。`docs/operations/recovery.md`参照） |
 | AWS Budgets | コスト監視設定であり、インフラ再構築サイクルと無関係 |
-| Vercel Project Pause/Resume | Vercel Terraform Providerが非対応（全49リソースのドキュメント・プロバイダソースを確認済み）。手動CLI操作で対応（`docs/operations/shutdown.md`） |
+| Vercel Project Pause | Vercel Terraform Providerが非対応（全49リソースのドキュメント・プロバイダソースを確認済み）。加えてVercel CLIの`pause`はTTY必須の対話確認を要求する仕様のため自動化できず、ユーザーが対話ターミナルで手動実行する（`docs/operations/shutdown.md`）。Resumeは`recover.sh`がREST API（`resume_vercel_project()`）で自動実行する（後述） |
 
 ---
 
@@ -250,10 +250,26 @@ Regional NAT Gateway（`availability_mode = "regional"`）を作成すると、A
 | 論点 | 分類 | 内容 |
 | --- | --- | --- |
 | A. terraform apply直後にECSがECR image不存在で失敗する可能性 | **自動化可能** | 初回applyのTask Definitionは`<ECRリポジトリURL>:latest`という雛形を参照するが、ECRは空のため必ず起動に失敗する。これは想定内で、`prod/recover.sh`もこの状態を前提に、ECSの安定化を待たずに直後のGitHub Actions CDへ進む設計にしている。CDが正しいimageで新revisionを登録した時点で正常化する。 |
-| B. RDS再作成後にFlywayで初期migrationが自動実行されるか | **自動化可能（要検証）** | Spring Boot標準のFlyway自動実行（`spring.flyway.enabled`既定値）により、アプリ起動時に空のDBへ`db/migration`が自動適用される設計。ただし実際のdestroy→recoveryサイクルでの実地確認はまだ行っていないため、次回実施時にCloudWatch Logsでの確認が必須。 |
-| C. ALB再作成後にRoute53 Aliasをどう更新するか | **手動作業** | Route53 Hosted Zoneは意図的にTerraform管理外。`prod/recover.sh`は現在のAliasと新ALBのDNS名を自動比較し、差分があれば実行すべき`aws route53 change-resource-record-sets`コマンドを画面表示した上で処理を停止する（DNS誤設定の影響が大きいため自動実行はしない）。 |
+| B. RDS再作成後にFlywayで初期migrationが自動実行されるか | **自動化可能（実地検証済み・既知の落とし穴あり）** | Spring Boot標準のFlyway自動実行（`spring.flyway.enabled`既定値）により、アプリ起動時に空のDBへ`db/migration`が自動適用されることを実地確認済み。ただし`rds.tf`に`db_name`が未設定だったため、初回の実地検証では`pitvia`データベース自体が存在せずコンテナがクラッシュし続けるという重大な問題が発覚した（詳細は下記「実地復旧で発覚した問題と対応」）。`db_name = "pitvia"`を追加済みだが、既存インスタンスには反映されない属性のため次回の完全なdestroy→recoveryで有効性を再検証すること。 |
+| C. ALB再作成後にRoute53 Aliasをどう更新するか | **自動化可能** | Route53 Hosted Zoneは意図的にTerraform管理外だが、`api.pitviaapp.com`のAliasレコード1件だけは`prod/recover.sh`が自動比較し、差分があれば`jq -n`で安全に生成したchange-batch JSONで`aws route53 change-resource-record-sets`（UPSERT）を自動実行し、反映結果を再確認する。失敗時はfail-closedで停止しVercel resume等には進まない。Hosted Zone自体や他レコードは一切変更しない。 |
 | D. ACM証明書を再利用できるか | **自動化可能** | `data "aws_acm_certificate" "api"`で既存の発行済み証明書を参照する設計のため、ALBが再作成されてもACM証明書自体は不変・自動的に再アタッチされる。手動作業は不要。 |
-| E. JWT secret再作成後の再投入方法 | **自動化可能** | `prod/recover.sh`が`openssl rand`で新しい値を生成し、画面・ログに一切出力せず`put-secret-value`で投入する。既に値が設定済みの場合はスキップ（`--force-jwt-reset`で強制可）。リフレッシュトークン無効化は許容済みの仕様。 |
-| F. Vercel pause/resumeをどこで実施するか | **自動化可能** | Terraform Provider非対応のため、`prod/shutdown.sh`/`prod/recover.sh`内でVercel CLI（`vercel project pause/resume`）を直接呼び出す。失敗してもAWS側の処理はブロックせず、警告を出して手動対応を促す。 |
-| G. GitHub Actions CDをmainから安全にworkflow_dispatchできるか | **自動化可能** | `deploy.yml`の`workflow_dispatch`はinput無しで安全に実行できる仕様。`gh workflow run deploy.yml --ref main`を実機で複数回実行し成功を確認済み。`prod/recover.sh`はrun IDを特定し、完了・成功まで自動監視する。 |
-| H. recovery完了後にterraform plan = No changesになるか | **要検証** | 現在の定常状態（destroyを経ていない状態）でのapply→CD実行→plan確認では`No changes`を確認済み。ただし実際のdestroy→apply一巡でも同じ結果になるかは、本ドキュメント整備時点ではまだ実地検証していない（`docs/operations/shutdown.md` / `recovery.md`の手順自体は整備済み）。 |
+| E. JWT secret再作成後の再投入方法 | **自動化可能** | `prod/recover.sh`が`openssl rand`で新しい値を生成し、画面・ログに一切出力せず`put-secret-value`で投入する。既に値が設定済みの場合はスキップ（`--force-jwt-reset`で強制可）。リフレッシュトークン無効化は許容済みの仕様。ただし実地検証で、Terraform管理外のIAMインラインポリシーが再作成後の新Secret ARNを許可しておらず`AccessDeniedException`が発生する問題が発覚した（下記参照）。 |
+| F. Vercel pause/resumeをどこで実施するか | **自動化可能（一部手動）** | Terraform Provider非対応。Pauseは、Vercel CLIがTTY必須の対話確認を要求し自動化できないため、`prod/shutdown.sh`は実行せず「pause済みであること」の確認のみ行う（pause自体はユーザーが対話ターミナルで手動実行）。Resumeは同じCLI制約を回避するため、`prod/recover.sh`がVercel REST API（`POST /v1/projects/{id}/unpause`、`common.sh`の`resume_vercel_project()`）を直接呼び出して自動実行する。失敗してもAWS側の処理はブロックせず、警告を出して手動対応を促す。 |
+| G. GitHub Actions CDをmainから安全にworkflow_dispatchできるか | **自動化可能** | `deploy.yml`の`workflow_dispatch`はinput無しで安全に実行できる仕様。`gh workflow run deploy.yml --ref main`を実機で複数回実行し成功を確認済み。`prod/recover.sh`はrun IDを特定し、完了・成功まで自動監視する。ただし実地検証で、ALB Target Group ARNのハードコード・対応するIAM権限不足という2つの問題が発覚した（下記参照）。 |
+| H. recovery完了後にterraform plan = No changesになるか | **実地検証済み（2026-09-08〜09）** | 実際のdestroy→apply→recovery一巡を実施し、最終的に`terraform plan`が`infra/terraform/aws`でNo changesになることを確認した。ただし一発では完了せず、IAM 2件・RDS db_name・deploy.ymlの計4件の問題を都度発見・修正しながらの復旧となった（詳細は下記「実地復旧で発覚した問題と対応」）。 |
+
+---
+
+# 実地復旧で発覚した問題と対応（2026-09-08〜09実施）
+
+Issue #30の実地検証（実際にAWS本番β環境をdestroy→recoveryした）で発覚した、**Terraform管理外の設定に「destroy/recreateで変化するAWSのID/ARN」がハードコードされていた**ことに起因する問題。いずれも実際にCD失敗やコンテナクラッシュとして顕在化した。
+
+| # | 問題 | 原因 | 対応 | 恒久対応の状態 |
+| --- | --- | --- | --- | --- |
+| 1 | ECSタスクが`AccessDeniedException`でSecrets Managerから値を取得できない | IAM Role`pitvia-ecs-execution-role`のインラインポリシー`pitvia-ecs-secrets-read`のResourceが、shutdown前の旧Secret ARN（JWT・RDSマスターパスワード）を固定値で参照していた。RDS/Secrets Managerをdestroy→recreateするとSecret ARNのランダムサフィックスが変わるため不一致になる | Resourceを`pitvia/prod/jwt-secret-key-*` / `rds!db-*`のワイルドカードパターンに変更（AWS CLIで直接`put-role-policy`。IAMはTerraform管理外のため） | ✅ 恒久対応済み（今後のdestroy/recreateで再発しない） |
+| 2 | `deploy.yml`の「Resolve target group ARN」ステップが`AccessDenied`で失敗 | 問題4（下記）の対応でGitHub Actions側に`aws elbv2 describe-target-groups`呼び出しを追加したが、対応するIAM権限（`elasticloadbalancing:DescribeTargetGroups`）を`pitvia-github-actions-deploy-role`のインラインポリシー`pitvia-github-actions-cd-policy`に追加し忘れていた | Actionに`elasticloadbalancing:DescribeTargetGroups`を追加（Resourceは既存の`"*"`のまま） | ✅ 恒久対応済み |
+| 3 | ECSタスクが`FATAL: database "pitvia" does not exist`でクラッシュし続ける | `rds.tf`の`aws_db_instance.main`に`db_name`が未設定で、RDS再作成時にデフォルトの`postgres`データベースしか作られない | 一時的なECS Fargate Task（`postgres`イメージ、RDSマスターSecretを注入）で`CREATE DATABASE pitvia;`を実行して即時復旧。あわせて`rds.tf`に`db_name = "pitvia"`を追加 | ⚠️ コードは追加済みだが、既存RDSインスタンスに対しては`db_name`が`forces replacement`（強制置き換え）と判定されるため未apply。**次回の完全なdestroy→recovery（RDSが新規作成される場合）で自動的に反映される想定**。それまでは`terraform plan`に`db_name`起因の差分（1 to add, 1 to destroy）が残り続ける点に注意 |
+| 4 | `deploy.yml`の「Check ALB target health」が`TargetGroupNotFound`で失敗 | `TARGET_GROUP_ARN`にALB Target Groupのフル ARN（末尾にAWSが払い出すランダムサフィックス）をハードコードしていた。ALBが再作成されるとTarget Groupも新しいARNで再作成される | `TARGET_GROUP_ARN`のハードコードをやめ、`TARGET_GROUP_NAME`（不変）から`aws elbv2 describe-target-groups`で都度ARNを動的解決するよう`deploy.yml`を修正 | ✅ 恒久対応済み（`main`ブランチに反映済み） |
+| 5 | Route53 Aliasの手動更新が復旧フローを止めていた | `api.pitviaapp.com`のAliasがALB再作成後の新DNS名を指しておらず、`recover.sh`は差分検出時に手動コマンドを表示して停止する設計だった | `recover.sh`のRoute53 Alias確認を、`jq -n`で安全に生成したchange-batch JSONによる自動UPSERTに変更（Hosted Zone自体・他レコードは変更しない） | ✅ 恒久対応済み |
+
+**教訓**: ALB Target Group ARN・RDS Secret ARN・JWT Secret ARNはいずれも「AWSが作成時にランダムな識別子を払い出す」という共通の性質を持ち、destroy→recreateのたびに値が変わる。Terraformコード側は動的参照（`aws_lb_target_group.api.arn`等）を使っていれば自動的に追従するが、**Terraform管理外の設定（IAM、GitHub Actions、手動運用コマンド）に同じ値を固定でハードコードすると、次のdestroy→recreateで必ず壊れる**。このパターンに該当する箇所が他にないか、`docs/infrastructure/terraform.md`の「管理しない」セクションに挙げたリソース（Route53・ACM・IAM・AWS Budgets）は棚卸し済みで、上記5件以外には見つかっていない。

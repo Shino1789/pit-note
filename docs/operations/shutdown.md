@@ -72,7 +72,7 @@ terraform destroy
 ```
 
 - AWS Budgetsのアラートが正常な範囲に収まっていることを確認する。
-- Route53の`api.pitviaapp.com`Aliasレコードは残ったままになる（ALB削除により参照先が無効化されるが、レコード自体は削除されない）。次回再構築時、`docs/operations/recovery.md`の手順でAliasを更新する。
+- Route53の`api.pitviaapp.com`Aliasレコードは残ったままになる（ALB削除により参照先が無効化されるが、レコード自体は削除されない）。次回再構築時、`recover.sh`が新しいALBへ自動UPSERTする（`docs/operations/recovery.md`参照）。
 
 ---
 
