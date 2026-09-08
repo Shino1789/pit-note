@@ -35,7 +35,11 @@ env:
   ECS_SERVICE: pitvia-api-service
   ECS_TASK_DEFINITION_FAMILY: pitvia-api
   CONTAINER_NAME: pitvia-api
-  TARGET_GROUP_ARN: arn:aws:elasticloadbalancing:ap-northeast-1:956118719101:targetgroup/pitvia-api-tg/c4e2de922dac5934
+  # ・Target Group ARNは末尾にAWSが払い出すランダムな識別子を含むため、
+  #   Terraformでの再作成（destroy→apply）により値が変わりうる。
+  #   固定ARNをハードコードせず、名前から都度解決する（下記「Resolve
+  #   target group ARN」ステップ参照）
+  TARGET_GROUP_NAME: pitvia-api-tg
 
 jobs:
   # ==================================================
@@ -223,11 +227,22 @@ jobs:
             --query "services[0].deployments[*].{status:status,taskDefinition:taskDefinition,rolloutState:rolloutState,rolloutStateReason:rolloutStateReason}" \
             >> "$GITHUB_STEP_SUMMARY"
 
+      # ・Target Group ARNを名前から解決する（末尾のランダム識別子は
+      #   Terraformでの再作成のたびに変わるため、ハードコードしない）
+      - name: Resolve target group ARN
+        id: tg
+        run: |
+          ARN=$(aws elbv2 describe-target-groups \
+            --names "$TARGET_GROUP_NAME" \
+            --query "TargetGroups[0].TargetGroupArn" \
+            --output text)
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
       # ALB Target GroupでECS新タスクがhealthyになっていることを確認
       - name: Check ALB target health
         run: |
           aws elbv2 describe-target-health \
-            --target-group-arn "$TARGET_GROUP_ARN" \
+            --target-group-arn "${{ steps.tg.outputs.arn }}" \
             --query "TargetHealthDescriptions[*].TargetHealth.State"
 
       # 外部疎通確認（参考情報。一時的なネットワーク障害でCD全体を失敗させないためcontinue-on-error）
