@@ -34,6 +34,11 @@ resource "aws_db_instance" "main" {
   multi_az               = false
 
   username                    = "pitvia"
+
+# RDS新規作成時にアプリケーション接続先の pitvia DB を自動作成する。
+# 既存インスタンスでは変更不可（replacement）となるため、
+# 既存RDSへの適用は行わず、次回のdestroy→recovery時に反映する。
+  db_name                     = "pitvia"
   manage_master_user_password = true
 
   backup_retention_period      = 1
