@@ -36,6 +36,13 @@
 # 使い方:
 #   ./scripts/prod/shutdown.sh            # 通常実行（二段階確認あり）
 #   ./scripts/prod/shutdown.sh --dry-run  # destroy対象の確認のみ（確認・destroyともにしない）
+#
+# 終了コード:
+#   0 = destroy成功、かつ完了検証（Terraform管理対象0件・保護対象
+#       リソース健在・消去対象リソースの削除確認）すべて正常
+#   1 = destroy自体の失敗（die）、またはdestroyは成功したが完了検証で
+#       未解消の項目がある場合（画面表示が「destroyが完了しました」
+#       でもexit 1になりうるため、必ず終了コードで判定すること）
 # ==================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -284,54 +291,92 @@ fi
 # --------------------------------------------------
 log_step "destroy完了検証"
 
+# ・terraform applyの終了コードだけでなく、この検証結果も
+#   最終的なスクリプトの終了コードに反映する（recover.shの
+#   overall_ok方式と同じ考え方）。従来はここで見つかった不整合が
+#   すべてlog_warnどまりで、画面上「destroyが完了しました」と
+#   表示されながら実際には未解消の項目が残るケースを終了コードで
+#   判別できなかった
+overall_ok=true
+
 remaining_managed=$( (cd "$TF_AWS_DIR" && terraform state list 2>/dev/null) | grep -c "^aws_" || true)
 if [ "$remaining_managed" -eq 0 ]; then
   log_info "Terraform管理対象のAWSリソースはStateから0件（想定通り）"
 else
   log_warn "Terraform Stateに管理対象リソースが${remaining_managed}件残っています（本来は0件のはず）"
   (cd "$TF_AWS_DIR" && terraform state list) | grep "^aws_" || true
+  overall_ok=false
 fi
 
 log_step "保護対象リソースの存在確認（read-only、Terraform管理外）"
-{
-  aws route53 list-hosted-zones --query "HostedZones[?Name=='${FRONTEND_DOMAIN}.']" --output text 2>/dev/null | grep -q . \
-    && log_info "  Route53 Hosted Zone（${FRONTEND_DOMAIN}）: 存在" \
-    || log_warn "  Route53 Hosted Zone（${FRONTEND_DOMAIN}）: 確認できませんでした（要手動確認）"
 
-  aws s3api head-bucket --bucket pitvia-terraform-state 2>/dev/null \
-    && log_info "  Terraform State S3バケット（pitvia-terraform-state）: 存在" \
-    || log_warn "  Terraform State S3バケット（pitvia-terraform-state）: 確認できませんでした（要手動確認）"
+if aws route53 list-hosted-zones --query "HostedZones[?Name=='${FRONTEND_DOMAIN}.']" --output text 2>/dev/null | grep -q .; then
+  log_info "  Route53 Hosted Zone（${FRONTEND_DOMAIN}）: 存在"
+else
+  log_warn "  Route53 Hosted Zone（${FRONTEND_DOMAIN}）: 確認できませんでした（要手動確認）"
+  overall_ok=false
+fi
 
-  aws iam get-role --role-name pitvia-github-actions-deploy-role >/dev/null 2>&1 \
-    && log_info "  IAM Role（pitvia-github-actions-deploy-role）: 存在" \
-    || log_warn "  IAM Role（pitvia-github-actions-deploy-role）: 確認できませんでした（要手動確認）"
+if aws s3api head-bucket --bucket pitvia-terraform-state 2>/dev/null; then
+  log_info "  Terraform State S3バケット（pitvia-terraform-state）: 存在"
+else
+  log_warn "  Terraform State S3バケット（pitvia-terraform-state）: 確認できませんでした（要手動確認）"
+  overall_ok=false
+fi
 
-  aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList" --output text 2>/dev/null | grep -q . \
-    && log_info "  GitHub OIDC Provider: 存在" \
-    || log_warn "  GitHub OIDC Provider: 確認できませんでした（要手動確認）"
+if aws iam get-role --role-name pitvia-github-actions-deploy-role >/dev/null 2>&1; then
+  log_info "  IAM Role（pitvia-github-actions-deploy-role）: 存在"
+else
+  log_warn "  IAM Role（pitvia-github-actions-deploy-role）: 確認できませんでした（要手動確認）"
+  overall_ok=false
+fi
 
-  aws budgets describe-budgets --account-id "$EXPECTED_AWS_ACCOUNT_ID" --query "Budgets" --output text 2>/dev/null | grep -q . \
-    && log_info "  AWS Budgets: 存在" \
-    || log_warn "  AWS Budgets: 確認できませんでした（要手動確認）"
-} || true
+if aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList" --output text 2>/dev/null | grep -q .; then
+  log_info "  GitHub OIDC Provider: 存在"
+else
+  log_warn "  GitHub OIDC Provider: 確認できませんでした（要手動確認）"
+  overall_ok=false
+fi
+
+if aws budgets describe-budgets --account-id "$EXPECTED_AWS_ACCOUNT_ID" --query "Budgets" --output text 2>/dev/null | grep -q .; then
+  log_info "  AWS Budgets: 存在"
+else
+  log_warn "  AWS Budgets: 確認できませんでした（要手動確認）"
+  overall_ok=false
+fi
 
 log_step "消えるべきリソースの確認（read-only、代表的なものを個別確認）"
-{
-  aws rds describe-db-instances --db-instance-identifier "$RDS_IDENTIFIER" >/dev/null 2>&1 \
-    && log_warn "  RDS（${RDS_IDENTIFIER}）: まだ存在しています" \
-    || log_info "  RDS（${RDS_IDENTIFIER}）: 削除済み"
 
-  aws s3api head-bucket --bucket pitvia-prod-storage >/dev/null 2>&1 \
-    && log_warn "  S3バケット（pitvia-prod-storage）: まだ存在しています" \
-    || log_info "  S3バケット（pitvia-prod-storage）: 削除済み"
+if aws rds describe-db-instances --db-instance-identifier "$RDS_IDENTIFIER" >/dev/null 2>&1; then
+  log_warn "  RDS（${RDS_IDENTIFIER}）: まだ存在しています"
+  overall_ok=false
+else
+  log_info "  RDS（${RDS_IDENTIFIER}）: 削除済み"
+fi
 
-  aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1 \
-    && log_warn "  ECR（${ECR_REPOSITORY}）: まだ存在しています" \
-    || log_info "  ECR（${ECR_REPOSITORY}）: 削除済み"
-} || true
+if aws s3api head-bucket --bucket pitvia-prod-storage >/dev/null 2>&1; then
+  log_warn "  S3バケット（pitvia-prod-storage）: まだ存在しています"
+  overall_ok=false
+else
+  log_info "  S3バケット（pitvia-prod-storage）: 削除済み"
+fi
 
-log_info "destroyが完了しました"
+if aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1; then
+  log_warn "  ECR（${ECR_REPOSITORY}）: まだ存在しています"
+  overall_ok=false
+else
+  log_info "  ECR（${ECR_REPOSITORY}）: 削除済み"
+fi
+
 echo ""
 echo "  次に行うこと:"
 echo "  ・./scripts/prod/status.sh で状態を確認する"
 echo "  ・復旧する場合は ./scripts/prod/recover.sh を実行する（docs/operations/recovery.md参照）"
+
+if [ "$overall_ok" = true ]; then
+  log_info "destroyが完了しました（Terraform管理対象0件、保護対象リソース健在をすべて確認済み）"
+  exit 0
+else
+  log_warn "destroyは実行されましたが、検証で未解消の項目があります。上記の警告を確認してください"
+  exit 1
+fi
