@@ -26,6 +26,7 @@ Terraformの前提・構成は`docs/infrastructure/terraform.md`を参照。自�
 | ECS Cluster/Service/Task Definition | 稼働中のコンテナ・Task Definition revision履歴 | ✅ Terraform apply + CDで再構築可能 |
 | Secrets Manager（JWT） | JWT署名鍵の値（`recovery_window_in_days=0`のため即時削除） | ✅ 再生成可能（既存リフレッシュトークン/セッションは無効化） |
 | VPC / Subnet / SG / NAT Gateway / ALB | ネットワーク構成一式（ALBは再作成でDNS名が変わる） | ✅ Terraform applyで再構築可能 |
+| CloudWatch Logs（`/ecs/pitvia-api`） | ECSタスクの標準出力ログ全履歴（過去のアプリケーションログ） | ❌ 復旧不可（Terraform apply後は空のロググループから再開） |
 
 ## 1. 事前確認
 

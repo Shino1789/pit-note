@@ -254,6 +254,17 @@ DESTROY_MAX_ELAPSED_SECONDS=1800 # 累計30分
 DESTROY_BACKOFF_BASE_SECONDS=30  # attempt毎のbackoff: 30s, 60s, 90s...
 DESTROY_BACKOFF_MAX_SECONDS=90   # backoffの上限（それ以上は増やさない）
 
+# --------------------------------------------------
+# recover.sh: ECS/ALB health確認のpolling設定
+# ・GitHub Actions CD側で既にecs wait services-stable + ALB target
+#   health確認を経ているため、通常は初回で安定しているはずだが、
+#   単発チェックだと一時的な揺らぎ（タスク再起動直後等）を
+#   誤って失敗と判定しうる。CD完了待ち（10.〜11.）と同じ
+#   bounded retryの考え方を、短い時間幅で適用する
+# --------------------------------------------------
+RECOVER_HEALTH_MAX_ATTEMPTS=10   # 初回 + retry9回
+RECOVER_HEALTH_INTERVAL_SECONDS=10 # 試行間隔（最大で約100秒）
+
 # infra/terraform/aws が現在管理しているAWSリソースの「型」一覧。
 # destroy planにこれ以外のaws_*リソースが含まれていた場合は、
 # コードに想定外の変更が紛れ込んでいる可能性があるため停止する

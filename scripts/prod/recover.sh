@@ -14,8 +14,11 @@
 # 避けるため、CD実行より前＝terraform apply直後に前倒ししている。
 # 理由はdocs/operations/recovery.md参照）:
 #    1. AWSアカウント/リージョン確認
-#    2. Terraform backend確認
-#    3. terraform init
+#    2. Terraform backend確認 / 3. terraform init
+#       （AWS用に加えてVercel用 infra/terraform/vercel も同時に初期化する。
+#       resume_vercel_project がVercel Terraformのremote stateから
+#       project_idを取得するため、17.の直前ではなくここで先に
+#       初期化しておく）
 #    4. terraform plan
 #    5. destroy/replaceが含まれていないことを確認
 #    6. ユーザー確認
@@ -39,6 +42,13 @@
 # 使い方:
 #   ./scripts/prod/recover.sh                    # 通常実行
 #   ./scripts/prod/recover.sh --force-jwt-reset  # 既存JWT値があっても再生成する
+#
+# 終了コード:
+#   0 = AWS側ヘルスチェック・Vercel resume・terraform planすべて正常（完全復旧）
+#   1 = 途中でdie（致命的エラー）、または最後まで到達したが一部が
+#       未解消（health_ok=false / Vercel resume失敗 / terraform plan
+#       自体の失敗のいずれか）。画面表示が「復旧フロー完了」でも
+#       exit 1になりうるため、必ず終了コードで判定すること
 # ==================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -67,11 +77,35 @@ log_step "Terraform backend確認"
 check_terraform_backend "$TF_AWS_DIR" "s3"
 ( cd "$TF_AWS_DIR" && terraform init -input=false )
 
+# ・Vercel用（infra/terraform/vercel）もここで初期化する。17.の
+#   Vercel resumeで使う resume_vercel_project は
+#   `terraform -chdir=infra/terraform/vercel output -raw project_id`
+#   に依存しており、このディレクトリが未初期化の環境（新しい
+#   CIランナー等）で実行するとproject_id取得に失敗し、AWS側の
+#   復旧が完了しているのにVercel resumeだけ失敗する事態が実地で
+#   発生した。特定マシンのローカル状態に依存させないよう、S3
+#   backend（remote state）から確実に読める状態にしておく
+check_terraform_backend "$TF_VERCEL_DIR" "s3"
+( cd "$TF_VERCEL_DIR" && terraform init -input=false )
+
 # --------------------------------------------------
 # 4. terraform plan
 # --------------------------------------------------
 log_step "terraform plan"
 APPLY_PLAN_FILE="$TF_AWS_DIR/.prod-recover.apply.tfplan"
+# ・terraform applyが失敗すると、set -eによりこの後の明示的な
+#   `rm -f`（成功時・キャンセル時のcleanup）に到達できないまま
+#   スクリプトが終了し、plan fileが残ってしまっていた。EXIT trapで
+#   スクリプトの終了経路（成功／die／set -eによる異常終了）に
+#   関わらず確実に削除する。既存のcleanup（yes/no・EOF時の明示的な
+#   rm -f）はそのまま維持し、この trap はそれらを置き換えるのでは
+#   なく「apply失敗時にも確実に片付ける」ための追加の安全網。
+#   失敗したplanを再利用して再applyする、といった動作は行わない
+#   （このtrapは削除のみを行う）
+cleanup_apply_plan_file() {
+  rm -f "$APPLY_PLAN_FILE"
+}
+trap cleanup_apply_plan_file EXIT
 ( cd "$TF_AWS_DIR" && terraform plan -no-color -input=false -out="$APPLY_PLAN_FILE" )
 # ・-no-colorを付けないと、terraform showの出力にANSI色コードが
 #   混ざりgrepの行頭マッチ（^Plan:等）が一致しなくなるため必須
@@ -81,10 +115,18 @@ echo "  $plan_summary"
 
 # --------------------------------------------------
 # 5. destroy/replaceが含まれていないことを確認
+# ・plan summaryの取得自体に失敗した場合（terraform showの異常終了、
+#   出力形式が想定外でgrepが空を返す等）は、destroy/replaceの
+#   有無を判定できていない＝最も危険な状態のため、fail-closedで
+#   即座に停止する（fail-openで確認プロンプトへ進めない）
 # --------------------------------------------------
+if [[ "$plan_summary" == *"(取得失敗)"* ]]; then
+  die "plan summaryを取得できず、destroy/replaceが含まれていないか確認できませんでした" \
+    "terraform planを再実行して内容を確認してください。"
+fi
 if [[ "$plan_summary" == *"to destroy"* ]] && [[ "$plan_summary" != *"0 to destroy"* ]]; then
   die "planにdestroy/replaceが含まれています。想定外の変更です。" \
-    "terraform show \"$APPLY_PLAN_FILE\" の内容を確認し、コードとAWSの実状態を精査してください。"
+    "terraform planを再実行して内容を確認してください。"
 fi
 
 # --------------------------------------------------
@@ -150,6 +192,19 @@ aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
 # --------------------------------------------------
 log_step "GitHub Actions CD実行（deploy.yml, --ref main）"
 
+# ・workflow_dispatch APIはトリガーしたrunのIDを同期的に返さない
+#   仕様のため、直後に一覧から特定する。deploy.ymlはpushトリガーも
+#   持つため、他の人の変更が同時にpushされた場合など「直近1件」
+#   （--limit 1）だけを見ると別のrunを取り違える恐れがある。
+#   トリガー時刻以降・event=workflow_dispatch・headBranch=mainの
+#   runに絞ることで取り違えのリスクを大きく減らす（複数人が同時に
+#   workflow_dispatchした場合の完全な一意特定までは保証しない）
+# ・`gh run list --jq`はjq式を1つだけ受け取るオプションであり、
+#   `gh`自身にjqの`--arg`を渡すことはできない（`--jq --arg since ...`
+#   は`gh`に未知のサブコマンド`since`として解釈されエラーになる）。
+#   そのため `gh run list --json ...` でJSONを取得し、パイプで
+#   通常のjqへ`--arg`を渡す2段階の方式にする
+trigger_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 run_output=$(gh workflow run deploy.yml --ref main 2>&1) || die "workflow_dispatchの実行に失敗しました: $run_output" \
   "GitHub CLIの認証状態（gh auth status）を確認してください。"
 echo "$run_output"
@@ -158,8 +213,23 @@ log_info "CDの起動を検知しています..."
 run_id=""
 for _ in $(seq 1 10); do
   sleep 3
-  run_id=$(gh run list --workflow=deploy.yml --limit 1 --json databaseId,event,createdAt \
-    --jq '.[0].databaseId' 2>/dev/null || echo "")
+  run_id=$(gh run list \
+    --workflow=deploy.yml \
+    --limit 10 \
+    --json databaseId,event,createdAt,headBranch \
+    2>/dev/null |
+    jq -r --arg since "$trigger_time" '
+      [.[] |
+        select(
+          .event == "workflow_dispatch" and
+          .headBranch == "main" and
+          .createdAt >= $since
+        )
+      ]
+      | sort_by(.createdAt)
+      | last
+      | .databaseId // empty
+    ' 2>/dev/null || echo "")
   [ -n "$run_id" ] && break
 done
 
@@ -202,9 +272,24 @@ log_info "GitHub Actions CDが成功しました（run #$run_id）"
 log_step "ECSロールアウト確認"
 health_ok=true
 
-ecs_json=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
-  --query 'services[0].{status:status,runningCount:runningCount,desiredCount:desiredCount,taskDefinition:taskDefinition,rolloutState:deployments[0].rolloutState}' \
-  --output json)
+# ・CD側で既にecs wait services-stableを経ているため通常は初回で
+#   安定しているはずだが、単発チェックだと一時的な揺らぎを誤って
+#   失敗と判定しうるため、短いbounded retryで確認する
+ecs_ok=false
+for attempt in $(seq 1 "$RECOVER_HEALTH_MAX_ATTEMPTS"); do
+  ecs_json=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+    --query 'services[0].{status:status,runningCount:runningCount,desiredCount:desiredCount,taskDefinition:taskDefinition,rolloutState:deployments[0].rolloutState}' \
+    --output json)
+  ecs_running=$(echo "$ecs_json" | jq -r '.runningCount')
+  ecs_desired=$(echo "$ecs_json" | jq -r '.desiredCount')
+
+  if [ "$ecs_running" = "$ecs_desired" ] && [ "$ecs_running" != "0" ]; then
+    ecs_ok=true
+    break
+  fi
+  [ "$attempt" -lt "$RECOVER_HEALTH_MAX_ATTEMPTS" ] && sleep "$RECOVER_HEALTH_INTERVAL_SECONDS"
+done
+
 echo "$ecs_json" | jq -r '
   "  status         : \(.status)",
   "  runningCount   : \(.runningCount)",
@@ -212,11 +297,8 @@ echo "$ecs_json" | jq -r '
   "  taskDefinition : \(.taskDefinition)",
   "  rolloutState   : \(.rolloutState)"
 '
-
-ecs_running=$(echo "$ecs_json" | jq -r '.runningCount')
-ecs_desired=$(echo "$ecs_json" | jq -r '.desiredCount')
-if [ "$ecs_running" != "$ecs_desired" ] || [ "$ecs_running" = "0" ]; then
-  log_warn "ECSのrunningCountがdesiredCountと一致していません"
+if [ "$ecs_ok" != true ]; then
+  log_warn "ECSのrunningCountがdesiredCountと一致していません（${RECOVER_HEALTH_MAX_ATTEMPTS}回確認）"
   health_ok=false
 fi
 
@@ -226,12 +308,21 @@ fi
 log_step "ALB Target Health確認"
 tg_arn=$(aws elbv2 describe-target-groups --names "$TARGET_GROUP_NAME" \
   --query 'TargetGroups[0].TargetGroupArn' --output text)
-tg_states=$(aws elbv2 describe-target-health --target-group-arn "$tg_arn" \
-  --query 'TargetHealthDescriptions[].TargetHealth.State' --output text)
-echo "  $tg_states"
 
-if ! echo "$tg_states" | grep -qw "healthy"; then
-  log_warn "ALB Target Groupにhealthyなターゲットがありません"
+tg_ok=false
+for attempt in $(seq 1 "$RECOVER_HEALTH_MAX_ATTEMPTS"); do
+  tg_states=$(aws elbv2 describe-target-health --target-group-arn "$tg_arn" \
+    --query 'TargetHealthDescriptions[].TargetHealth.State' --output text)
+  if echo "$tg_states" | grep -qw "healthy"; then
+    tg_ok=true
+    break
+  fi
+  [ "$attempt" -lt "$RECOVER_HEALTH_MAX_ATTEMPTS" ] && sleep "$RECOVER_HEALTH_INTERVAL_SECONDS"
+done
+
+echo "  $tg_states"
+if [ "$tg_ok" != true ]; then
+  log_warn "ALB Target Groupにhealthyなターゲットがありません（${RECOVER_HEALTH_MAX_ATTEMPTS}回確認）"
   health_ok=false
 fi
 
@@ -241,8 +332,17 @@ fi
 log_step "ALB直接health確認"
 alb_dns_name=$( (cd "$TF_AWS_DIR" && terraform output -raw alb_dns_name) )
 alb_zone_id=$( (cd "$TF_AWS_DIR" && terraform output -raw alb_zone_id) )
-alb_direct_code=$(curl -s -o /dev/null -w "%{http_code}" -k \
-  -H "Host: ${ROUTE53_RECORD_NAME}" "https://${alb_dns_name}${API_HEALTH_PATH}" || echo "000")
+# ・`curl ... || echo "000"`は、curlが接続に失敗した場合でも
+#   -wが"000"を出力した上でcurl自体が非ゼロ終了するため、
+#   "000"（-wの出力）+"000"（echoの出力）が連結され"000000"に
+#   なる不具合があった。ifでcurlの終了ステータスとcodeの代入を
+#   分離し、失敗時は明示的に"000"で上書きする
+if alb_direct_code=$(curl -s -o /dev/null -w "%{http_code}" -k \
+  -H "Host: ${ROUTE53_RECORD_NAME}" "https://${alb_dns_name}${API_HEALTH_PATH}"); then
+  :
+else
+  alb_direct_code="000"
+fi
 echo "  https://${alb_dns_name}${API_HEALTH_PATH} (Host: ${ROUTE53_RECORD_NAME}) -> HTTP $alb_direct_code"
 
 if [ "$alb_direct_code" != "200" ]; then
@@ -356,12 +456,34 @@ fi
 
 # --------------------------------------------------
 # 16. API health確認（カスタムドメイン経由）
+# ・Route53 API上のUPSERTが成功していても、公開DNS解決側への反映
+#   には多少の時間差がありうるため、bounded retryで確認する
+#   （Route53 API上でAliasが新ALBを指していることは15.で既に
+#   確認済みだが、それだけではhealth_ok=trueにしない。実際に
+#   カスタムドメイン経由でHTTP 200が返ることまで確認する）
 # --------------------------------------------------
 log_step "API health確認（カスタムドメイン経由）"
-api_code=$(curl -s -o /dev/null -w "%{http_code}" "https://${ROUTE53_RECORD_NAME}${API_HEALTH_PATH}" || echo "000")
+api_code="000"
+api_ok=false
+for attempt in $(seq 1 "$RECOVER_HEALTH_MAX_ATTEMPTS"); do
+  # ・`curl ... || echo "000"`だと、curl失敗時に-wの"000"出力と
+  #   echoの"000"が連結され"000000"になる不具合があったため、
+  #   ifで終了ステータスとcodeの代入を分離する
+  if api_code=$(curl -s -o /dev/null -w "%{http_code}" "https://${ROUTE53_RECORD_NAME}${API_HEALTH_PATH}"); then
+    :
+  else
+    api_code="000"
+  fi
+  if [ "$api_code" = "200" ]; then
+    api_ok=true
+    break
+  fi
+  [ "$attempt" -lt "$RECOVER_HEALTH_MAX_ATTEMPTS" ] && sleep "$RECOVER_HEALTH_INTERVAL_SECONDS"
+done
+
 echo "  https://${ROUTE53_RECORD_NAME}${API_HEALTH_PATH} -> HTTP $api_code"
-if [ "$api_code" != "200" ]; then
-  log_warn "API health確認がHTTP 200以外です"
+if [ "$api_ok" != true ]; then
+  log_warn "API health確認がHTTP 200以外です（${RECOVER_HEALTH_MAX_ATTEMPTS}回確認）"
   health_ok=false
 fi
 
@@ -373,10 +495,12 @@ fi
 #   ことになるため、health_okがfalseの場合はresumeせず停止する
 # --------------------------------------------------
 log_step "Vercel Project resume判定"
+vercel_resume_ok=false
 if [ "$health_ok" = true ]; then
   log_info "AWS側のヘルスチェックがすべて正常なため、Vercel Projectをresumeします"
   if resume_vercel_project; then
     log_info "Vercel Projectをresumeしました"
+    vercel_resume_ok=true
   else
     log_warn "Vercel Projectのresumeに失敗しました。手動で 'vercel project resume $VERCEL_PROJECT_NAME' を実行してください。"
   fi
@@ -391,25 +515,54 @@ fi
 # 18. Frontend health確認
 # --------------------------------------------------
 log_step "Frontend health確認"
-frontend_code=$(curl -s -o /dev/null -w "%{http_code}" "https://${FRONTEND_DOMAIN}" || echo "000")
+if frontend_code=$(curl -s -o /dev/null -w "%{http_code}" "https://${FRONTEND_DOMAIN}"); then
+  :
+else
+  frontend_code="000"
+fi
 echo "  https://${FRONTEND_DOMAIN} -> HTTP $frontend_code"
 
 # --------------------------------------------------
 # 19. 最終terraform plan（No changes期待）
+# ・-detailed-exitcodeの意味論（Terraform公式）に沿って明確に分岐する:
+#   0=No changes（正常） / 2=差分あり（警告。db_name等、意図的に
+#   未applyの差分が残ることがあるため許容） / それ以外=Terraform
+#   コマンド自体の失敗（認証切れ・state破損等の重大なエラー）
 # --------------------------------------------------
 log_step "最終terraform plan確認"
-( cd "$TF_AWS_DIR" && terraform plan -no-color -input=false -detailed-exitcode ) && \
-  log_info "No changes（想定通り）" || {
-    code=$?
-    if [ "$code" = "2" ]; then
-      log_warn "terraform planに差分が残っています。内容を確認してください。"
-    else
-      log_warn "terraform planの実行でエラーが発生しました。"
-    fi
-  }
-
-log_step "復旧フロー完了"
-if [ "$health_ok" != true ]; then
-  log_warn "AWS側のヘルスチェックに未解消の失敗があります。Vercel resumeも未実行です。"
+if ( cd "$TF_AWS_DIR" && terraform plan -no-color -input=false -detailed-exitcode ); then
+  plan_exit=0
+else
+  plan_exit=$?
 fi
+
+case "$plan_exit" in
+  0) log_info "No changes（想定通り）" ;;
+  2) log_warn "terraform planに差分が残っています。内容を確認してください。" ;;
+  *) log_error "terraform planの実行に失敗しました（exit $plan_exit）" ;;
+esac
+
+# --------------------------------------------------
+# 復旧フロー完了判定
+# ・AWS側ヘルスチェック（health_ok）・Vercel resume成否
+#   （vercel_resume_ok）・最終terraform plan（plan_exitが0か2）の
+#   すべてが揃って初めて「完全復旧」とし、exit 0にする。
+#   1つでも欠けていれば「部分復旧」としてexit 1で終了する
+#   （画面上は「復旧完了」と見えても実際には未完了、という
+#   状態を終了コードからも判別できるようにするため）
+# --------------------------------------------------
+log_step "復旧フロー完了"
+overall_ok=true
+[ "$health_ok" = true ] || overall_ok=false
+[ "$vercel_resume_ok" = true ] || overall_ok=false
+{ [ "$plan_exit" = "0" ] || [ "$plan_exit" = "2" ]; } || overall_ok=false
+
 echo "  ./scripts/prod/status.sh で最終状態を再確認してください。"
+
+if [ "$overall_ok" = true ]; then
+  log_info "AWS側ヘルスチェック・Vercel resume・terraform planすべて正常です。復旧が完全に完了しました"
+  exit 0
+else
+  log_warn "復旧が部分的に未完了です。上記の警告・エラーを解消してください"
+  exit 1
+fi
