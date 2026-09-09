@@ -63,7 +63,7 @@ for arg in "$@"; do
   esac
 done
 
-require_commands aws terraform jq curl vercel gh git openssl
+require_commands aws terraform jq curl vercel gh git openssl dig
 
 # --------------------------------------------------
 # 1. AWSアカウント/リージョン確認
@@ -332,17 +332,13 @@ fi
 log_step "ALB直接health確認"
 alb_dns_name=$( (cd "$TF_AWS_DIR" && terraform output -raw alb_dns_name) )
 alb_zone_id=$( (cd "$TF_AWS_DIR" && terraform output -raw alb_zone_id) )
-# ・`curl ... || echo "000"`は、curlが接続に失敗した場合でも
-#   -wが"000"を出力した上でcurl自体が非ゼロ終了するため、
-#   "000"（-wの出力）+"000"（echoの出力）が連結され"000000"に
-#   なる不具合があった。ifでcurlの終了ステータスとcodeの代入を
-#   分離し、失敗時は明示的に"000"で上書きする
-if alb_direct_code=$(curl -s -o /dev/null -w "%{http_code}" -k \
-  -H "Host: ${ROUTE53_RECORD_NAME}" "https://${alb_dns_name}${API_HEALTH_PATH}"); then
-  :
-else
-  alb_direct_code="000"
-fi
+# ・alb_dns_name自体もDNS解決を要するため、実行環境のローカルDNSが
+#   一時的に不調な場合に備えてhttp_code_with_dns_fallback()を使う
+#   （DNS解決失敗＝curl exit 6の場合のみCloudflare DNSでフォールバック。
+#   IPアドレスはハードコードせず毎回digで取得する）
+alb_direct_code=$(http_code_with_dns_fallback \
+  "https://${alb_dns_name}${API_HEALTH_PATH}" "$alb_dns_name" 443 \
+  -k -H "Host: ${ROUTE53_RECORD_NAME}")
 echo "  https://${alb_dns_name}${API_HEALTH_PATH} (Host: ${ROUTE53_RECORD_NAME}) -> HTTP $alb_direct_code"
 
 if [ "$alb_direct_code" != "200" ]; then
@@ -466,14 +462,12 @@ log_step "API health確認（カスタムドメイン経由）"
 api_code="000"
 api_ok=false
 for attempt in $(seq 1 "$RECOVER_HEALTH_MAX_ATTEMPTS"); do
-  # ・`curl ... || echo "000"`だと、curl失敗時に-wの"000"出力と
-  #   echoの"000"が連結され"000000"になる不具合があったため、
-  #   ifで終了ステータスとcodeの代入を分離する
-  if api_code=$(curl -s -o /dev/null -w "%{http_code}" "https://${ROUTE53_RECORD_NAME}${API_HEALTH_PATH}"); then
-    :
-  else
-    api_code="000"
-  fi
+  # ・DNS解決失敗（curl exit 6）の場合のみCloudflare DNSでフォールバック
+  #   する（http_code_with_dns_fallback()、common.sh参照）。実行環境の
+  #   ローカルDNSが一時的に不調でも、実際のAPIが正常なら誤って
+  #   health_ok=falseにしないため
+  api_code=$(http_code_with_dns_fallback \
+    "https://${ROUTE53_RECORD_NAME}${API_HEALTH_PATH}" "$ROUTE53_RECORD_NAME" 443)
   if [ "$api_code" = "200" ]; then
     api_ok=true
     break
@@ -515,11 +509,7 @@ fi
 # 18. Frontend health確認
 # --------------------------------------------------
 log_step "Frontend health確認"
-if frontend_code=$(curl -s -o /dev/null -w "%{http_code}" "https://${FRONTEND_DOMAIN}"); then
-  :
-else
-  frontend_code="000"
-fi
+frontend_code=$(http_code_with_dns_fallback "https://${FRONTEND_DOMAIN}" "$FRONTEND_DOMAIN" 443)
 echo "  https://${FRONTEND_DOMAIN} -> HTTP $frontend_code"
 
 # --------------------------------------------------

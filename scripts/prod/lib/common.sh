@@ -213,6 +213,70 @@ resume_vercel_project() {
   return 1
 }
 
+# ・curlがDNS解決失敗（exit code 6 = CURLE_COULDNT_RESOLVE_HOST）で
+#   失敗した場合に限り、信頼できるパブリックDNS（Cloudflare 1.1.1.1）で
+#   名前解決をやり直し、得られたIPで--resolveして再試行する。
+#   実機で確認済み: curlのexit codeはDNS解決失敗のみ6、接続拒否は7、
+#   タイムアウトは28であり、明確に区別できる。ALB等のIPアドレスは
+#   destroy/recreateで変わりうるため、IPをコードにハードコードせず
+#   毎回digで取得する（recover.sh実行環境のローカルDNSリゾルバが
+#   一時的に不調でも、実際のAPI/インフラが正常なら誤ってhealth_ok=
+#   falseにしないため）
+# ・DNS以外の失敗（接続不可・タイムアウト等、exit code 6以外）や、
+#   HTTP応答自体が取得できた場合（5xx等も含む）はフォールバックしない。
+#   本当にAPI/インフラが落ちている場合まで「正常」に見せかけないため
+# 引数: $1=URL, $2=--resolveに使うhost, $3=--resolveに使うport,
+#       $4以降=curlへの追加オプション（例: -k, -H "Host: ..."）
+# 出力: HTTPステータスコード（取得できなければ"000"）
+# 戻り値: 0=何らかのHTTPステータスコードを取得できた（200かどうかは
+#   呼び出し側で判定） / 1=DNS以外の理由も含め取得できなかった
+http_code_with_dns_fallback() {
+  local url="$1" resolve_host="$2" resolve_port="$3"
+  shift 3
+  local extra_args=("$@")
+
+  local code curl_exit
+  code=$(curl -s -o /dev/null -w "%{http_code}" "${extra_args[@]}" "$url")
+  curl_exit=$?
+
+  if [ "$curl_exit" -eq 0 ]; then
+    echo "$code"
+    return 0
+  fi
+
+  if [ "$curl_exit" -ne 6 ]; then
+    # DNS以外の失敗（接続不可・タイムアウト等）はフォールバックしない
+    echo "000"
+    return 1
+  fi
+
+  # ・log_warn/log_infoの出力は標準出力(stdout)のため、この関数を
+  #   $(...)で呼び出す側のHTTPステータスコードにログ文字列が混ざって
+  #   しまわないよう、ここでは明示的にstderr(>&2)へ出す
+  log_warn "  ローカルDNS解決に失敗しました（curl exit 6）。Cloudflare DNS（1.1.1.1）で再解決します" >&2
+  local resolved_ip
+  resolved_ip=$(dig @1.1.1.1 +short "$resolve_host" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+
+  if [ -z "$resolved_ip" ]; then
+    log_warn "  Cloudflare DNSでも解決できませんでした" >&2
+    echo "000"
+    return 1
+  fi
+
+  log_info "  Cloudflare DNSでの解決結果（${resolved_ip}）でリトライします" >&2
+  code=$(curl -s -o /dev/null -w "%{http_code}" --resolve "${resolve_host}:${resolve_port}:${resolved_ip}" "${extra_args[@]}" "$url")
+  curl_exit=$?
+
+  if [ "$curl_exit" -ne 0 ]; then
+    echo "000"
+    return 1
+  fi
+
+  log_warn "  APIは正常に応答しましたが、ローカルDNS解決に問題がありました（実行環境固有の問題の可能性。Cloudflare DNS経由での疎通は確認できています）" >&2
+  echo "$code"
+  return 0
+}
+
 # 現在のgit branch/作業状態を表示する（判断材料の提示のみ。ブロックはしない）
 show_git_context() {
   log_step "Gitブランチ/作業状態確認"
