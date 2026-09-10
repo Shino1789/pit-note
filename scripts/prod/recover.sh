@@ -544,9 +544,12 @@ echo "  https://${FRONTEND_DOMAIN} -> HTTP $frontend_code"
 # --------------------------------------------------
 # 19. 最終terraform plan（No changes期待）
 # ・-detailed-exitcodeの意味論（Terraform公式）に沿って明確に分岐する:
-#   0=No changes（正常） / 2=差分あり（警告。db_name等、意図的に
-#   未applyの差分が残ることがあるため許容） / それ以外=Terraform
-#   コマンド自体の失敗（認証切れ・state破損等の重大なエラー）
+#   0=No changes（正常。実機検証では完全なdestroy→recovery後に
+#   これを確認済み） / 2=差分あり（警告。forces replacement属性
+#   （db_name等）をコード変更した直後で、既存リソースには未反映の
+#   差分が意図的に残っているケース等が該当しうるため、即dieはせず
+#   警告に留める） / それ以外=Terraformコマンド自体の失敗（認証切れ・
+#   state破損等の重大なエラー）
 # --------------------------------------------------
 log_step "最終terraform plan確認"
 if ( cd "$TF_AWS_DIR" && terraform plan -no-color -input=false -detailed-exitcode ); then

@@ -256,7 +256,7 @@ Regional NAT Gateway（`availability_mode = "regional"`）を作成すると、A
 | E. JWT secret再作成後の再投入方法 | **自動化可能** | `prod/recover.sh`が`openssl rand`で新しい値を生成し、画面・ログに一切出力せず`put-secret-value`で投入する。既に値が設定済みの場合はスキップ（`--force-jwt-reset`で強制可）。リフレッシュトークン無効化は許容済みの仕様。ただし実地検証で、Terraform管理外のIAMインラインポリシーが再作成後の新Secret ARNを許可しておらず`AccessDeniedException`が発生する問題が発覚した（下記参照）。 |
 | F. Vercel pause/resumeをどこで実施するか | **自動化可能（一部手動）** | Terraform Provider非対応。Pauseは、Vercel CLIがTTY必須の対話確認を要求し自動化できないため、`prod/shutdown.sh`は実行せず「pause済みであること」の確認のみ行う（pause自体はユーザーが対話ターミナルで手動実行）。Resumeは同じCLI制約を回避するため、`prod/recover.sh`がVercel REST API（`POST /v1/projects/{id}/unpause`、`common.sh`の`resume_vercel_project()`）を直接呼び出して自動実行する。失敗してもAWS側の処理はブロックせず、警告を出して手動対応を促す。 |
 | G. GitHub Actions CDをmainから安全にworkflow_dispatchできるか | **自動化可能** | `deploy.yml`の`workflow_dispatch`はinput無しで安全に実行できる仕様。`gh workflow run deploy.yml --ref main`を実機で複数回実行し成功を確認済み。`prod/recover.sh`はrun IDを特定し、完了・成功まで自動監視する。ただし実地検証で、ALB Target Group ARNのハードコード・対応するIAM権限不足という2つの問題が発覚した（下記参照）。 |
-| H. recovery完了後にterraform plan = No changesになるか | **実地検証済み（2026-09-08〜09）** | 実際のdestroy→apply→recovery一巡を実施し、最終的に`terraform plan`が`infra/terraform/aws`でNo changesになることを確認した。ただし一発では完了せず、IAM 2件・RDS db_name・deploy.ymlの計4件の問題を都度発見・修正しながらの復旧となった（詳細は下記「実地復旧で発覚した問題と対応」）。 |
+| H. recovery完了後にterraform plan = No changesになるか | **実地検証済み（2026-09-08〜09, 複数回）** | 実際のdestroy→apply→recovery一巡を複数回実施し、最終的に`terraform plan`が`infra/terraform/aws`でNo changesになることを確認した。初回はIAM 2件・RDS db_name・deploy.ymlの計4件、2回目以降はmacOS Bash 3.2環境依存の問題とALB Target Health待機時間不足の計2件を都度発見・修正しながらの復旧となった（詳細は下記「実地復旧で発覚した問題と対応」）。 |
 
 ---
 
@@ -268,8 +268,24 @@ Issue #30の実地検証（実際にAWS本番β環境をdestroy→recoveryした
 | --- | --- | --- | --- | --- |
 | 1 | ECSタスクが`AccessDeniedException`でSecrets Managerから値を取得できない | IAM Role`pitvia-ecs-execution-role`のインラインポリシー`pitvia-ecs-secrets-read`のResourceが、shutdown前の旧Secret ARN（JWT・RDSマスターパスワード）を固定値で参照していた。RDS/Secrets Managerをdestroy→recreateするとSecret ARNのランダムサフィックスが変わるため不一致になる | Resourceを`pitvia/prod/jwt-secret-key-*` / `rds!db-*`のワイルドカードパターンに変更（AWS CLIで直接`put-role-policy`。IAMはTerraform管理外のため） | ✅ 恒久対応済み（今後のdestroy/recreateで再発しない） |
 | 2 | `deploy.yml`の「Resolve target group ARN」ステップが`AccessDenied`で失敗 | 問題4（下記）の対応でGitHub Actions側に`aws elbv2 describe-target-groups`呼び出しを追加したが、対応するIAM権限（`elasticloadbalancing:DescribeTargetGroups`）を`pitvia-github-actions-deploy-role`のインラインポリシー`pitvia-github-actions-cd-policy`に追加し忘れていた | Actionに`elasticloadbalancing:DescribeTargetGroups`を追加（Resourceは既存の`"*"`のまま） | ✅ 恒久対応済み |
-| 3 | ECSタスクが`FATAL: database "pitvia" does not exist`でクラッシュし続ける | `rds.tf`の`aws_db_instance.main`に`db_name`が未設定で、RDS再作成時にデフォルトの`postgres`データベースしか作られない | 一時的なECS Fargate Task（`postgres`イメージ、RDSマスターSecretを注入）で`CREATE DATABASE pitvia;`を実行して即時復旧。あわせて`rds.tf`に`db_name = "pitvia"`を追加 | ⚠️ コードは追加済みだが、既存RDSインスタンスに対しては`db_name`が`forces replacement`（強制置き換え）と判定されるため未apply。**次回の完全なdestroy→recovery（RDSが新規作成される場合）で自動的に反映される想定**。それまでは`terraform plan`に`db_name`起因の差分（1 to add, 1 to destroy）が残り続ける点に注意 |
+| 3 | ECSタスクが`FATAL: database "pitvia" does not exist`でクラッシュし続ける | `rds.tf`の`aws_db_instance.main`に`db_name`が未設定で、RDS再作成時にデフォルトの`postgres`データベースしか作られない | 一時的なECS Fargate Task（`postgres`イメージ、RDSマスターSecretを注入）で`CREATE DATABASE pitvia;`を実行して即時復旧。あわせて`rds.tf`に`db_name = "pitvia"`を追加 | ✅ 恒久対応済み・実機検証済み。その後の完全なdestroy→recoveryで`db_name`込みのRDSが新規作成され、`terraform plan`が`No changes`になることを確認した |
 | 4 | `deploy.yml`の「Check ALB target health」が`TargetGroupNotFound`で失敗 | `TARGET_GROUP_ARN`にALB Target Groupのフル ARN（末尾にAWSが払い出すランダムサフィックス）をハードコードしていた。ALBが再作成されるとTarget Groupも新しいARNで再作成される | `TARGET_GROUP_ARN`のハードコードをやめ、`TARGET_GROUP_NAME`（不変）から`aws elbv2 describe-target-groups`で都度ARNを動的解決するよう`deploy.yml`を修正 | ✅ 恒久対応済み（`main`ブランチに反映済み） |
 | 5 | Route53 Aliasの手動更新が復旧フローを止めていた | `api.pitviaapp.com`のAliasがALB再作成後の新DNS名を指しておらず、`recover.sh`は差分検出時に手動コマンドを表示して停止する設計だった | `recover.sh`のRoute53 Alias確認を、`jq -n`で安全に生成したchange-batch JSONによる自動UPSERTに変更（Hosted Zone自体・他レコードは変更しない） | ✅ 恒久対応済み |
 
 **教訓**: ALB Target Group ARN・RDS Secret ARN・JWT Secret ARNはいずれも「AWSが作成時にランダムな識別子を払い出す」という共通の性質を持ち、destroy→recreateのたびに値が変わる。Terraformコード側は動的参照（`aws_lb_target_group.api.arn`等）を使っていれば自動的に追従するが、**Terraform管理外の設定（IAM、GitHub Actions、手動運用コマンド）に同じ値を固定でハードコードすると、次のdestroy→recreateで必ず壊れる**。このパターンに該当する箇所が他にないか、`docs/infrastructure/terraform.md`の「管理しない」セクションに挙げたリソース（Route53・ACM・IAM・AWS Budgets）は棚卸し済みで、上記5件以外には見つかっていない。
+
+---
+
+# 2回目以降の実地復旧で発覚した問題と対応（`scripts/prod`の実行環境依存）
+
+上記5件の解消後、さらに複数回`recover.sh`を実地実行する中で判明した、**AWSリソースの構成ではなく`scripts/prod`の実行環境（macOS標準bash・ローカルDNS）に起因する問題**。AWS側の構成に問題はなく、いずれもスクリプト側の対策で解消済み。
+
+| # | 問題 | 原因 | 対応 |
+| --- | --- | --- | --- |
+| 6 | `recover.sh`が`run_id`等の変数で`unbound variable`エラーになり途中終了する | macOS標準bash（3.2、2007年当時のGPLv2最終版で機能凍結）で、`set -u`有効時に`$var`（波括弧無し）の直後に全角文字等のマルチバイト文字が区切りなく続くと、変数名の切り出しを誤る既知の不具合がある（bash 4.4以降では発生しない） | 該当する全箇所（`recover.sh`7箇所・`common.sh`2箇所・`status.sh`1箇所）を`${var}`（波括弧あり）に統一 |
+| 7 | `http_code_with_dns_fallback()`が追加curlオプション無しの呼び出しで`unbound variable`になる | macOS標準bash 3.2では、`set -u`有効時に要素数0の配列を`"${array[@]}"`で展開すると`unbound variable`になる既知の不具合（bash 4.4で修正済み） | `${array[@]+"${array[@]}"}`イディオムに変更（配列が空でも展開エラーにならない） |
+| 8 | health確認のretryループが1回目の失敗で即座に終了する（設計上は複数回retryするはず） | `var=$(cmd)`という代入文のみの行は、コマンド置換（`cmd`）の終了ステータスがそのまま代入文自体の終了ステータスになる。`set -e`下でこれが非0だと、bashの仕様上その時点でスクリプト全体が即終了する | `http_code_with_dns_fallback()`の全呼び出し箇所（ALB直接health・API health・Frontend health）を`if var=$(...); then :; else var="000"; fi`の形にし、失敗を`if`条件で吸収してretryループを継続させる |
+| 9 | ALB Target Healthが`healthy`になる前に`recover.sh`がタイムアウト扱いにする | ALB Target Group（`interval=30秒`・`healthy_threshold=5回連続`）が実際に`healthy`と判定するまでの所要時間は理論最短120秒（`(healthy_threshold-1)×interval`）、実際はアプリ起動時間も含め150〜250秒超になりうるのに対し、共通のhealth確認retry予算（最大約100秒）では不足していた | ALB Target Health確認専用のretry予算`ALB_TARGET_HEALTH_MAX_ATTEMPTS`/`ALB_TARGET_HEALTH_INTERVAL_SECONDS`（最大約300秒、`common.sh`）を新設し、STEP13のみで使用する（他のhealth確認は既存の共通予算のまま） |
+| 10 | 実行環境のローカルDNSが一時的に`api.pitviaapp.com`等を解決できず、API/ALBが実際には正常でも`recover.sh`が異常と判定しうる | 実機で`curl`が`exit 6`（`CURLE_COULDNT_RESOLVE_HOST`）を返すケースを確認。ローカルDNSリゾルバ（自宅ルーター等）のキャッシュに起因すると考えられ、AWS/Route53側は正常だった | `http_code_with_dns_fallback()`（`common.sh`）を新設。`curl`が`exit 6`（DNS解決失敗のみ）の場合に限り、Cloudflare Public DNS（`dig @1.1.1.1`）で再解決し`curl --resolve`で再試行する。DNS以外の失敗（接続不可・タイムアウト・5xx等）はフォールバックしない（インフラが本当に落ちている場合まで「正常」に見せかけないため） |
+
+**教訓**: 上記5件が「AWSリソースIDのハードコード」に起因していたのに対し、この5件は「macOS標準bash（3.2）の既知の不具合」と「スクリプト実行環境のローカルDNS」という、AWS/Terraformの構成とは独立した環境依存の問題だった。`scripts/prod`配下は今後も`set -euo pipefail`かつmacOS標準bash（3.2系）での動作を前提に、`${var}`（波括弧必須）・`${array[@]+"${array[@]}"}`（空配列展開）・`var=$(cmd)`を単独行にしない（`if`等の条件式に置く）、の3点を新規追加時にも維持すること。

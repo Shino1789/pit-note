@@ -456,12 +456,20 @@ validate_destroy_only_plan() {
 
 # 破壊的操作の前に、単純なyes/noではなく完全一致の文字列入力を要求する
 # ・入力が1文字でも異なれば即終了する（大文字小文字・空白も含めて完全一致）
+# ・readをbareで呼ぶと、EOF/read失敗時（exit status != 0）にset -eで
+#   即終了してしまい、"中止しました"の表示なしに終わる。shutdown.sh/
+#   recover.shの他のread呼び出しと同じく、read自体をif条件に置いて
+#   その挙動を吸収する
 confirm_exact_phrase() {
   local phrase="$1"
   local answer
-  read -r -p "入力: " answer
-  if [ "$answer" != "$phrase" ]; then
-    log_info "入力が一致しなかったため中止しました（何も変更していません）"
+  if read -r -p "入力: " answer; then
+    if [ "$answer" != "$phrase" ]; then
+      log_info "入力が一致しなかったため中止しました（何も変更していません）"
+      exit 0
+    fi
+  else
+    log_info "入力を受け取れなかったため中止しました（何も変更していません）"
     exit 0
   fi
 }

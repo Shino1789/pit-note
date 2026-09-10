@@ -12,7 +12,7 @@ Terraformの前提・構成は`docs/infrastructure/terraform.md`を参照。自�
 - **Terraform applyだけでは復旧は完了しない。** ECR image再push（GitHub Actions CD）、JWT Secret再投入、（ALB再作成時のみ）Route53 Alias自動更新、Vercel resumeが別途必要。
 - JWT Secret再投入・Route53 Alias更新・Vercel resumeは`recover.sh`が自動実行する。IAM/ACM/Route53 Hosted Zone自体はTerraform管理外のため変更しない（状態確認のみ）。
 - 復旧完了の最終確認は「`terraform plan`がNo changesであること」＋「API/Frontendへの実際の疎通確認」の両方で行う。
-- **実地検証（2026-09-08〜09実施）で判明した重要な注意点**: Terraform管理外のIAMインラインポリシー2件（Secrets ARN・ELB権限）と、RDSの`db_name`未設定という3つの問題により、初回の実地復旧では追加のIAM修正・DB手動作成が必要になった。詳細は`docs/infrastructure/terraform.md`の「実地復旧で発覚した問題と対応」を参照。
+- **実地検証（2026-09-08〜09実施、複数回）で判明した重要な注意点**: 初回はTerraform管理外のIAMインラインポリシー2件（Secrets ARN・ELB権限）とRDSの`db_name`未設定という3つの問題、2回目以降はmacOS標準bash（3.2）の既知の不具合とALB Target Healthの待機時間不足という2つの問題により、追加の修正が必要になった。いずれも恒久対応済みで、直近の実行では`terraform plan`が`No changes`になることまで確認している。詳細は`docs/infrastructure/terraform.md`の「実地復旧で発覚した問題と対応」「2回目以降の実地復旧で発覚した問題と対応」を参照。
 
 ---
 
@@ -71,8 +71,8 @@ CloudWatch Logs（`/ecs/pitvia-api`）でマイグレーション成功のログ
 
 `aws_db_instance.main`（`rds.tf`）は元々`db_name`が未設定だったため、RDSインスタンス再作成時にデフォルトの`postgres`データベースしか作られず、アプリケーションが接続しようとする`pitvia`データベース自体が存在しない状態になっていた（`FATAL: database "pitvia" does not exist`でコンテナがexit code 1でクラッシュし続ける）。
 
-- **恒久対応**: `rds.tf`に`db_name = "pitvia"`を追加済み。**次回の完全なdestroy→recovery（RDSインスタンス自体が新規作成される場合）では自動的に解消される**はずだが、`db_name`はインスタンス作成時のみ有効な属性のため未検証（次回実地検証時に必ず確認すること）。
-- **もし今後の復旧でも`database "pitvia" does not exist`が再発した場合**（例: `db_name`が何らかの理由で反映されない、または過去のRDSインスタンスを使い回すケース）、一時的なECS Fargate Task（`postgres`公式イメージ、RDSマスターSecretを`secrets`経由で注入、private subnet + ECS SG）で`CREATE DATABASE pitvia;`を実行することで復旧できる（実地検証で採用した方法。既存の`pitvia-ecs-execution-role`の権限で完結し、恒久的なAWSリソースは残らない）。
+- **恒久対応（実機検証済み）**: `rds.tf`に`db_name = "pitvia"`を追加済み。その後の完全なdestroy→recovery（RDSインスタンスが新規作成されるケース）で、`db_name`込みでRDSが作成され、追加の手動対応なしに`pitvia`データベースへ接続できること、および`terraform plan`が`No changes`になることを確認済み。
+- **もし今後の復旧でも`database "pitvia" does not exist`が再発した場合**（例: `db_name`を含まない過去のRDSインスタンスを使い回すケース等）、一時的なECS Fargate Task（`postgres`公式イメージ、RDSマスターSecretを`secrets`経由で注入、private subnet + ECS SG）で`CREATE DATABASE pitvia;`を実行することで復旧できる（実地検証で採用した方法。既存の`pitvia-ecs-execution-role`の権限で完結し、恒久的なAWSリソースは残らない）。
 - 詳細は`docs/infrastructure/terraform.md`の「実地復旧で発覚した問題と対応」を参照。
 
 ---
@@ -107,6 +107,8 @@ terraform -chdir=infra/terraform/aws output -raw alb_zone_id
 ```
 
 `prod/recover.sh`はこの値を使い、ALBのDNS名に直接アクセスして（カスタムドメインを経由せず）ECS/ALBの疎通自体が正常かを先に確認する。
+
+**ALB Target Healthの待機時間について**: ALB Target Group（`interval=30秒`・`healthy_threshold=5回連続`）が新規登録ターゲットを`healthy`と判定するまでの所要時間は、理論最短でも`(healthy_threshold-1)×interval=120秒`、実際にはアプリ起動時間（Spring Boot起動・DB接続確立・初回Flyway migration等）が上乗せされ150〜250秒超になりうる。そのため`prod/recover.sh`はALB Target Health確認だけ他のヘルスチェックより長い専用の待機予算（最大約300秒、`common.sh`の`ALB_TARGET_HEALTH_MAX_ATTEMPTS`/`ALB_TARGET_HEALTH_INTERVAL_SECONDS`）を使う。手動で確認する場合も、`healthy`になるまで数分程度かかることを前提に待つこと。
 
 ---
 
@@ -152,6 +154,8 @@ curl https://api.pitviaapp.com/api/v1/health
 ```
 
 `prod/recover.sh`は7.のRoute53確認が完了した後にこれを自動実行し、HTTP 200を確認する（ALBのTarget Groupヘルスチェックと同一パス）。
+
+**ローカルDNS解決失敗時のフォールバックについて**: `prod/recover.sh`のAPI/ALB/Frontend health確認は、`curl`がDNS解決失敗（`exit 6` = `CURLE_COULDNT_RESOLVE_HOST`）で失敗した場合に限り、Cloudflare Public DNS（`dig @1.1.1.1`）で再解決し`curl --resolve`で再試行する（`common.sh`の`http_code_with_dns_fallback()`）。これは実行環境（実行者のマシン・ネットワーク）のローカルDNSリゾルバが一時的に不調でも、AWS側のAPI/インフラ自体は正常なケースを誤って異常と判定しないための対策であり、実地の復旧作業で複数回発生することを確認している。DNS解決以外の失敗（接続不可・タイムアウト・5xx応答等）はフォールバックしない。なお、この対策はスクリプトの判定を守るものであり、復旧作業者自身のブラウザでも同様のDNS解決不調が起きている場合は別途ブラウザ側・ローカルネットワーク側の確認が必要になる（別ネットワークでの疎通確認、DNSサーバーの一時変更、ルーターの再起動等）。
 
 ---
 
