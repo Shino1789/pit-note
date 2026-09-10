@@ -327,15 +327,42 @@ DESTROY_BACKOFF_BASE_SECONDS=30  # attempt毎のbackoff: 30s, 60s, 90s...
 DESTROY_BACKOFF_MAX_SECONDS=90   # backoffの上限（それ以上は増やさない）
 
 # --------------------------------------------------
-# recover.sh: ECS/ALB health確認のpolling設定
-# ・GitHub Actions CD側で既にecs wait services-stable + ALB target
-#   health確認を経ているため、通常は初回で安定しているはずだが、
+# recover.sh: ECS/API/Frontend health確認のpolling設定
+# ・GitHub Actions CD側で既にecs wait services-stableを経ているため、
+#   ECSロールアウト確認（12.）は通常初回で安定しているはずだが、
 #   単発チェックだと一時的な揺らぎ（タスク再起動直後等）を
 #   誤って失敗と判定しうる。CD完了待ち（10.〜11.）と同じ
 #   bounded retryの考え方を、短い時間幅で適用する
+# ・ALB Target Health確認（13.）だけは別の専用予算
+#   （ALB_TARGET_HEALTH_*、下記）を使う。deploy.ymlの
+#   「Check ALB target health」はリトライなしの単発チェックであり、
+#   ecs wait services-stableもECSレベルの安定（running=desired）を
+#   保証するだけでALBのhealthy_threshold回連続成功までは保証しない
+#   ため、この短い予算ではまだ不十分なことがある（詳細は下記参照）
 # --------------------------------------------------
 RECOVER_HEALTH_MAX_ATTEMPTS=10   # 初回 + retry9回
 RECOVER_HEALTH_INTERVAL_SECONDS=10 # 試行間隔（最大で約100秒）
+
+# --------------------------------------------------
+# recover.sh: ALB Target Health確認（13.）専用のpolling設定
+# ・ALB Target Group（alb.tf）のhealth_checkはinterval=30秒・
+#   healthy_threshold=5回（連続成功）。AWSは登録直後にほぼ即座に
+#   1回目のチェックを行い、以降interval秒ごとに実行するため、
+#   理論上の最短所要時間は (healthy_threshold-1) × interval = 120秒
+#   （1回目のチェックが即座に成功した最良ケース）。実際にはアプリ
+#   （Spring Boot起動・DB接続確立・初回Flyway migration等）が
+#   ヘルスチェックに応答できるようになるまでの起動時間が上乗せされる
+#   ため、現実的には150〜250秒程度、場合によってはそれ以上かかりうる
+#   （ecs.tfのhealth_check_grace_period_seconds=360もこれを見込んだ
+#   既存の設計判断）。共通のRECOVER_HEALTH_*（最大約100秒）では
+#   完全なdestroy→recovery直後（ALB Targetが真新しい登録）の
+#   コールドスタートに対して不足するため、専用の長めの予算を設ける
+# ・20回 × 15秒間隔 = 最大約300秒（5分）。理論最短120秒に対して
+#   十分な余裕を持たせつつ、ECSのgrace period（360秒）は超えない
+#   範囲に収め、本当に異常な場合も無駄に長時間待ちすぎないようにする
+# --------------------------------------------------
+ALB_TARGET_HEALTH_MAX_ATTEMPTS=20    # 初回 + retry19回
+ALB_TARGET_HEALTH_INTERVAL_SECONDS=15 # 試行間隔（最大で約300秒）
 
 # infra/terraform/aws が現在管理しているAWSリソースの「型」一覧。
 # destroy planにこれ以外のaws_*リソースが含まれていた場合は、

@@ -309,20 +309,24 @@ log_step "ALB Target Health確認"
 tg_arn=$(aws elbv2 describe-target-groups --names "$TARGET_GROUP_NAME" \
   --query 'TargetGroups[0].TargetGroupArn' --output text)
 
+# ・ALB Target Group（interval=30秒・healthy_threshold=5回連続）の
+#   実際のhealthy判定所要時間（理論最短120秒、実際は150〜250秒超も
+#   ありうる）に合わせ、共通のRECOVER_HEALTH_*ではなく専用の
+#   ALB_TARGET_HEALTH_*（最大約300秒）を使う（common.sh参照）
 tg_ok=false
-for attempt in $(seq 1 "$RECOVER_HEALTH_MAX_ATTEMPTS"); do
+for attempt in $(seq 1 "$ALB_TARGET_HEALTH_MAX_ATTEMPTS"); do
   tg_states=$(aws elbv2 describe-target-health --target-group-arn "$tg_arn" \
     --query 'TargetHealthDescriptions[].TargetHealth.State' --output text)
   if echo "$tg_states" | grep -qw "healthy"; then
     tg_ok=true
     break
   fi
-  [ "$attempt" -lt "$RECOVER_HEALTH_MAX_ATTEMPTS" ] && sleep "$RECOVER_HEALTH_INTERVAL_SECONDS"
+  [ "$attempt" -lt "$ALB_TARGET_HEALTH_MAX_ATTEMPTS" ] && sleep "$ALB_TARGET_HEALTH_INTERVAL_SECONDS"
 done
 
 echo "  $tg_states"
 if [ "$tg_ok" != true ]; then
-  log_warn "ALB Target Groupにhealthyなターゲットがありません（${RECOVER_HEALTH_MAX_ATTEMPTS}回確認）"
+  log_warn "ALB Target Groupにhealthyなターゲットがありません（${ALB_TARGET_HEALTH_MAX_ATTEMPTS}回確認）"
   health_ok=false
 fi
 
