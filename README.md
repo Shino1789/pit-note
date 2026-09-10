@@ -6,7 +6,16 @@ Pitvia は、スポーツカー・旧車・カスタムカーオーナー向け�
 整備履歴・ショップ連携を一元管理できる Web アプリケーションです。
 
 一般的な整備記録アプリが「日常メンテナンス管理」を主軸とする中、
-Pitvia は **走る楽しさ・維持する楽しさ・育てる楽しさ** にフォーカスしたサービスを目指します。
+Pitvia は **🏎️ 走る楽しさ・🔧 維持する楽しさ・📊 育てる楽しさ** にフォーカスしたサービスを目指します。
+
+🌐 **Production:** https://pitviaapp.com
+
+> [!WARNING]
+>
+> ### 本番環境について
+>
+> β版ではAWSコスト削減のため、必要時のみTerraformで再構築しています。
+> そのため、タイミングによっては停止している場合があります。
 
 ---
 
@@ -32,31 +41,16 @@ Pitvia は、そうしたユーザー向けに設計されたサービスです�
 
 ---
 
-# コンセプト
-
-> 走るクルマの整備手帳
-
-整備記録だけではなく、
-
-- 愛車を育てる履歴
-- 走行後のコンディション管理
-- カスタム進化の記録
-- 信頼できるショップとの継続連携
-
-を提供します。
-
----
-
 # 想定ユーザー
 
-## オーナー（一般ユーザー）
+## 👤 オーナー（一般ユーザー）
 
 - スポーツカーオーナー
 - 旧車オーナー
 - サーキット走行ユーザー
 - カスタムカーオーナー
 
-## ショップ（事業者・店舗）
+## 🏪 ショップ（事業者・店舗）
 
 - 整備工場
 - チューニングショップ
@@ -68,7 +62,7 @@ Pitvia は、そうしたユーザー向けに設計されたサービスです�
 
 # 主な機能
 
-## 1. アカウント機能
+## 1. 🔐 アカウント機能
 
 - 新規登録 / ログイン
 - ロール権限管理
@@ -80,7 +74,7 @@ Pitvia は、そうしたユーザー向けに設計されたサービスです�
 
 ---
 
-## 2. 車両管理
+## 2. 🚘 車両管理
 
 - 複数台登録対応
 - メーカー
@@ -93,7 +87,7 @@ Pitvia は、そうしたユーザー向けに設計されたサービスです�
 
 ---
 
-## 3. 整備・カスタム履歴管理
+## 3. 🔧 整備・カスタム履歴管理
 
 - 作業日
 - 走行距離
@@ -108,7 +102,7 @@ Pitvia は、そうしたユーザー向けに設計されたサービスです�
 
 ---
 
-## 4. コスト管理
+## 4. 💰 コスト管理
 
 - 月別維持費
 - 年別維持費
@@ -117,14 +111,14 @@ Pitvia は、そうしたユーザー向けに設計されたサービスです�
 
 ---
 
-## 5. ショップ連携
+## 5. 🤝 ショップ連携
 
 車両単位でオーナーとショップを連携し、
 整備履歴を双方で共有できます。
 
 ---
 
-## 今後実装予定
+## 🚀 今後実装予定
 
 - LINE通知連携
 - 車検証OCR読み取り
@@ -135,52 +129,33 @@ Pitvia は、そうしたユーザー向けに設計されたサービスです�
 
 ---
 
-# Pitvia の差別化ポイント
-
-一般的な整備管理アプリとの違いとして、以下を重視します。
-
-## 一般向け整備アプリ
-
-- 日常メンテナンス
-- 車検管理
-- 整備記録保存
-
-## Pitvia
-
-- スポーツカー特化
-- 旧車特化
-- ショップ連携
-- 走るユーザー向け設計
-
----
-
 # 技術スタック
 
-## Frontend
+## 💻 Frontend
 
 - TypeScript
 - Next.js
 - Tailwind CSS
 
-## Backend
+## ⚙️ Backend
 
 - Java
 - Spring Boot
 - Spring Security
 - Spring Data JPA
 
-## Database
+## 🗄️ Database
 
 - PostgreSQL
 
-## Infrastructure
+## ☁️ Infrastructure
 
 - AWS
 - Vercel
 - Docker
 - Docker Compose
 
-## 開発ツール
+## 🛠️ 開発ツール
 
 - Git / GitHub
 - VS Code
@@ -191,12 +166,38 @@ Pitvia は、そうしたユーザー向けに設計されたサービスです�
 - Swagger UI
 - Bruno
 
-## 生成AI
+## 🤖 生成AI
 
 - ChatGPT (要件整理・設計レビュー)
 - Stitch (画面モック生成)
 - V0 (UIプロトタイピング)
 - Claude Code (実装・バグ調査・セキュリティ調査)
+
+---
+
+# Design Decisions 🤔
+
+## Why Next.js?
+
+フロントエンドとAPIを分離し、将来的なWeb / Mobile展開を考慮してNext.js + Spring Bootの構成を採用。
+
+## Why MinIO?
+
+開発環境でAWS S3を直接利用せず、S3互換APIを持つMinIOを利用することで、ローカル環境でも本番に近いストレージ構成を再現。
+
+## Why Terraform?
+
+AWS環境を手作業で構築すると再現性が低くなるため、TerraformによるIaCを採用。
+
+## Why Strategy Pattern?
+
+OWNER / SHOPで異なるダッシュボード集計処理を Service内のif/elseで増やしていくのではなく、Strategy Patternによって権限ごとの処理を分離。
+
+---
+
+## ER図
+
+![er-diagram](docs/images/er.png)
 
 ---
 
@@ -207,42 +208,50 @@ pitvia/
     ├── .editorconfig
     ├── .gitattributes
     ├── .gitignore
-    ├── .env.dev
     ├── .env.example
     ├── docker-compose.dev.yml
     ├── .github/
-    │   ├── pull_request_template.md
+    │   ├── pull_request_template.md
     │   └── workflows/
+    │       ├── test.yml      # CI: フロント(ESLint+Vitest) / バックエンド(JUnit)
+    │       └── deploy.yml    # CD: ECR push → ECS Task Definition更新 → 安定化確認
     ├── apps/
-    │   ├── web/        # Next.js
-    │   ├── api/        # Spring Boot API
-    │   └── mobile/     # 将来対応予定
+    │   ├── web/        # Next.js
+    │   ├── api/        # Spring Boot API
+    │   └── mobile/     # 将来対応予定
     ├── infra/
-    │   └── docker/
-    │       ├── api/
-    │       │   └── Dockerfile
-    │       └── web/
-    │           └── Dockerfile
+    │   ├── docker/
+    │   │   ├── api/
+    │   │   │   └── Dockerfile
+    │   │   └── web/
+    │   │       └── Dockerfile
+    │   └── terraform/          # AWS / Vercel を IaC で管理
+    │       ├── bootstrap/      # Terraform State用S3バケット（Local State）
+    │       ├── aws/             # VPC・RDS・S3・ECR・ECS・ALB 等
+    │       └── vercel/          # Vercel Project設定
     ├── scripts/
-    │   ├── up.sh
-    │   ├── down.sh
-    │   ├── logs.sh
-    │   └── reset.sh
+    │   ├── dev/        # ローカルDocker Compose操作（up/down/logs/reset）
+    │   └── prod/       # 本番β環境の操作（status確認 / shutdown / recover）
     ├── docs/
-    │   ├── architecture/
-    │   │   └── architecture.drawio       # draw.ioで作成したアプリ構成図
-    │   ├── ui/
-    │   │   └── figma-link.md
-    │   ├── api/
-    │   │   ├── bruno/
-    │   │   └── openapi.yaml
-    │   ├── db/
-    │   │   └── schema.dbml               # dbdiagram.ioで作成したdbml
-    │   ├── deployment/
-    │   │   └── environment-variables.md  # β版本番環境の環境変数・Secrets管理方針
-    │   └── images/
-    │       ├── architecture.png
-    │       └── er.png
+    │   ├── architecture/
+    │   │   └── architecture.drawio       # draw.ioで作成したアプリ構成図
+    │   ├── ui/
+    │   │   └── figma-link.md
+    │   ├── api/
+    │   │   ├── bruno/                    # Bruno APIコレクション
+    │   │   └── openapi.yaml
+    │   ├── db/
+    │   │   └── schema.dbml               # dbdiagram.ioで作成したdbml
+    │   ├── deployment/
+    │   │   └── environment-variables.md  # β版本番環境の環境変数・Secrets管理方針
+    │   ├── infrastructure/
+    │   │   └── terraform.md              # Terraform構成の設計方針
+    │   ├── operations/
+    │   │   ├── shutdown.md               # 本番β環境の停止手順
+    │   │   └── recovery.md               # 本番β環境の復旧手順
+    │   └── images/
+    │       ├── architecture.png
+    │       └── er.png
     ├── LICENSE
     ├── CLAUDE.md
     └── README.md
