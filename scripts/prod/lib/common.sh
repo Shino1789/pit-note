@@ -112,7 +112,7 @@ check_aws_identity() {
   echo "  Region  : ${AWS_REGION:-$EXPECTED_AWS_REGION}"
 
   if [ "$account_id" != "$EXPECTED_AWS_ACCOUNT_ID" ]; then
-    die "想定外のAWSアカウントです（期待値: $EXPECTED_AWS_ACCOUNT_ID / 実際: $account_id）" \
+    die "想定外のAWSアカウントです（期待値: $EXPECTED_AWS_ACCOUNT_ID / 実際: ${account_id}）" \
       "正しいAWSプロファイル/認証情報に切り替えてから再実行してください。"
   fi
 
@@ -209,7 +209,7 @@ resume_vercel_project() {
   if [ "$http_code" -ge 200 ] 2>/dev/null && [ "$http_code" -lt 300 ] 2>/dev/null; then
     return 0
   fi
-  log_warn "Vercel resume APIが失敗しました（HTTP $http_code）"
+  log_warn "Vercel resume APIが失敗しました（HTTP ${http_code}）"
   return 1
 }
 
@@ -236,7 +236,14 @@ http_code_with_dns_fallback() {
   local extra_args=("$@")
 
   local code curl_exit
-  code=$(curl -s -o /dev/null -w "%{http_code}" "${extra_args[@]}" "$url")
+  # ・extra_argsが空配列の場合（追加のcurlオプションを渡さない
+  #   呼び出し）、bash 3.2ではset -u有効時に"${extra_args[@]}"の
+  #   展開自体が"unbound variable"になる既知の不具合がある
+  #   （bash 4.4で修正済みだが、macOS標準bashは3.2のまま）。
+  #   ${array[@]+"${array[@]}"}という古典的なイディオムで、
+  #   配列が空の場合は何も展開されず、要素がある場合は通常通り
+  #   展開されるようにする
+  code=$(curl -s -o /dev/null -w "%{http_code}" ${extra_args[@]+"${extra_args[@]}"} "$url")
   curl_exit=$?
 
   if [ "$curl_exit" -eq 0 ]; then
@@ -264,7 +271,8 @@ http_code_with_dns_fallback() {
   fi
 
   log_info "  Cloudflare DNSでの解決結果（${resolved_ip}）でリトライします" >&2
-  code=$(curl -s -o /dev/null -w "%{http_code}" --resolve "${resolve_host}:${resolve_port}:${resolved_ip}" "${extra_args[@]}" "$url")
+  # ・上のcurl呼び出しと同じ理由で${array[@]+"${array[@]}"}イディオムを使う
+  code=$(curl -s -o /dev/null -w "%{http_code}" --resolve "${resolve_host}:${resolve_port}:${resolved_ip}" ${extra_args[@]+"${extra_args[@]}"} "$url")
   curl_exit=$?
 
   if [ "$curl_exit" -ne 0 ]; then

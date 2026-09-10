@@ -100,7 +100,7 @@ fi
 
 if aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1; then
   image_count=$(aws ecr list-images --repository-name "$ECR_REPOSITORY" --query 'length(imageIds)' --output text 2>/dev/null || echo "?")
-  echo "  ECR repository ($ECR_REPOSITORY) : 存在（イメージ数: $image_count）"
+  echo "  ECR repository ($ECR_REPOSITORY) : 存在（イメージ数: ${image_count}）"
 else
   log_warn "ECR repository ($ECR_REPOSITORY) が見つかりません"
 fi

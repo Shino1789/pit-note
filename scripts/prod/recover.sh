@@ -252,16 +252,16 @@ for _ in $(seq 1 120); do
 done
 
 if [ "$run_status" != "completed" ]; then
-  die "GitHub Actions runの完了を30分待っても確認できませんでした（run #$run_id）" \
+  die "GitHub Actions runの完了を30分待っても確認できませんでした（run #${run_id}）" \
     "gh run view $run_id で状況を確認してください。長時間かかっている場合は原因調査が必要です。"
 fi
 
 run_conclusion=$(gh run view "$run_id" --json conclusion --jq '.conclusion' 2>/dev/null || echo "unknown")
 if [ "$run_conclusion" != "success" ]; then
-  die "GitHub Actions CDが失敗しました（conclusion: $run_conclusion）" \
+  die "GitHub Actions CDが失敗しました（conclusion: ${run_conclusion}）" \
     "gh run view $run_id --log-failed でログを確認し、原因を解消してから ./scripts/prod/recover.sh を再実行してください。"
 fi
-log_info "GitHub Actions CDが成功しました（run #$run_id）"
+log_info "GitHub Actions CDが成功しました（run #${run_id}）"
 
 # --------------------------------------------------
 # 12. ECSロールアウト確認
@@ -336,9 +336,19 @@ alb_zone_id=$( (cd "$TF_AWS_DIR" && terraform output -raw alb_zone_id) )
 #   一時的に不調な場合に備えてhttp_code_with_dns_fallback()を使う
 #   （DNS解決失敗＝curl exit 6の場合のみCloudflare DNSでフォールバック。
 #   IPアドレスはハードコードせず毎回digで取得する）
-alb_direct_code=$(http_code_with_dns_fallback \
+# ・http_code_with_dns_fallback()がHTTPコードを一切取得できず
+#   return 1する場合がある（DNS以外の接続失敗等）。ベアな
+#   `var=$(...)`のままだと、コマンド置換を含む代入文の終了ステータスは
+#   その代入文自体の終了ステータスになるため、set -e下でreturn 1が
+#   そのままスクリプト全体の即時終了につながってしまう。if文の条件式に
+#   置くことでその挙動を吸収し、失敗時は明示的に"000"を設定する
+if alb_direct_code=$(http_code_with_dns_fallback \
   "https://${alb_dns_name}${API_HEALTH_PATH}" "$alb_dns_name" 443 \
-  -k -H "Host: ${ROUTE53_RECORD_NAME}")
+  -k -H "Host: ${ROUTE53_RECORD_NAME}"); then
+  :
+else
+  alb_direct_code="000"
+fi
 echo "  https://${alb_dns_name}${API_HEALTH_PATH} (Host: ${ROUTE53_RECORD_NAME}) -> HTTP $alb_direct_code"
 
 if [ "$alb_direct_code" != "200" ]; then
@@ -381,7 +391,7 @@ hosted_zone_id=$(aws route53 list-hosted-zones-by-name --dns-name "$FRONTEND_DOM
 #   （見つからない場合はRoute53側の重大な問題の可能性があるため、
 #   自動UPSERTはせず即座に停止する）
 if [ -z "$hosted_zone_id" ] || [ "$hosted_zone_id" = "None" ]; then
-  die "Route53 Hosted Zone（$FRONTEND_DOMAIN）が見つかりませんでした" \
+  die "Route53 Hosted Zone（${FRONTEND_DOMAIN}）が見つかりませんでした" \
     "Route53のHosted Zoneが存在するか、AWS権限が正しいか確認してください。"
 fi
 
@@ -403,7 +413,7 @@ if [ -n "$current_alias_dns" ] && [ "$current_alias_dns" != "None" ] && [ "$norm
   log_info "Route53 Aliasは現在のALBを指しています（更新不要）"
 else
   if [ -z "$current_alias_dns" ] || [ "$current_alias_dns" = "None" ]; then
-    log_info "Route53レコード（$ROUTE53_RECORD_NAME）が存在しないため、新規作成します"
+    log_info "Route53レコード（${ROUTE53_RECORD_NAME}）が存在しないため、新規作成します"
   else
     log_info "Route53 Aliasが現在のALBと異なるため、自動UPSERTします（ALBが再作成された可能性があります）"
   fi
@@ -447,7 +457,7 @@ else
     die "Route53レコードの更新後再確認に失敗しました（$ROUTE53_RECORD_NAME が新ALBを指していません）" \
       "aws route53 list-resource-record-sets --hosted-zone-id $hosted_zone_id で内容を確認してください。"
   fi
-  log_info "Route53 Aliasを新しいALBへ更新しました（$ROUTE53_RECORD_NAME -> $alb_dns_name）"
+  log_info "Route53 Aliasを新しいALBへ更新しました（$ROUTE53_RECORD_NAME -> ${alb_dns_name}）"
 fi
 
 # --------------------------------------------------
@@ -466,8 +476,17 @@ for attempt in $(seq 1 "$RECOVER_HEALTH_MAX_ATTEMPTS"); do
   #   する（http_code_with_dns_fallback()、common.sh参照）。実行環境の
   #   ローカルDNSが一時的に不調でも、実際のAPIが正常なら誤って
   #   health_ok=falseにしないため
-  api_code=$(http_code_with_dns_fallback \
-    "https://${ROUTE53_RECORD_NAME}${API_HEALTH_PATH}" "$ROUTE53_RECORD_NAME" 443)
+  # ・http_code_with_dns_fallback()がreturn 1する場合、ベアな
+  #   `var=$(...)`のままではset -eによりこのattemptで即座にスクリプト
+  #   全体が終了してしまい、bounded retry（次のattemptへ進む設計）が
+  #   機能しなくなる。if文の条件式に置いて吸収し、失敗時は"000"を
+  #   設定したうえで通常通り次のattemptへ進める
+  if api_code=$(http_code_with_dns_fallback \
+    "https://${ROUTE53_RECORD_NAME}${API_HEALTH_PATH}" "$ROUTE53_RECORD_NAME" 443); then
+    :
+  else
+    api_code="000"
+  fi
   if [ "$api_code" = "200" ]; then
     api_ok=true
     break
@@ -509,7 +528,13 @@ fi
 # 18. Frontend health確認
 # --------------------------------------------------
 log_step "Frontend health確認"
-frontend_code=$(http_code_with_dns_fallback "https://${FRONTEND_DOMAIN}" "$FRONTEND_DOMAIN" 443)
+# ・http_code_with_dns_fallback()のreturn 1がset -eで即終了に
+#   つながらないよう、if文の条件式で吸収する（他2箇所と同じ対応）
+if frontend_code=$(http_code_with_dns_fallback "https://${FRONTEND_DOMAIN}" "$FRONTEND_DOMAIN" 443); then
+  :
+else
+  frontend_code="000"
+fi
 echo "  https://${FRONTEND_DOMAIN} -> HTTP $frontend_code"
 
 # --------------------------------------------------
@@ -529,7 +554,7 @@ fi
 case "$plan_exit" in
   0) log_info "No changes（想定通り）" ;;
   2) log_warn "terraform planに差分が残っています。内容を確認してください。" ;;
-  *) log_error "terraform planの実行に失敗しました（exit $plan_exit）" ;;
+  *) log_error "terraform planの実行に失敗しました（exit ${plan_exit}）" ;;
 esac
 
 # --------------------------------------------------
