@@ -151,9 +151,24 @@ Pitvia は、そうしたユーザー向けに設計されたサービスです�
 ## ☁️ Infrastructure
 
 - AWS
+  - ALB
+  - ECS / Fargate
+  - RDS
+  - S3
+  - ECR
+  - Secrets Manager
+  - CloudWatch Logs
 - Vercel
-- Docker
-- Docker Compose
+- Terraform
+- Docker / Docker Compose
+
+## 🔁 CI/CD
+
+- GitHub Actions
+  - CI: Frontend ESLint / Vitest、Backend JUnit
+  - CD: BackendのDocker imageをECRへPush → ECSへデプロイ
+- Vercel
+  - FrontendのGitHub連携による自動デプロイ
 
 ## 🛠️ 開発ツール
 
